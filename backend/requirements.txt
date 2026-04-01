@@ -1,0 +1,42 @@
+# Core
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20
+pydantic-settings==2.7.0
+pydantic==2.10.5
+python-dotenv==1.0.1
+httpx==0.28.1
+
+# LangGraph + LangChain
+langgraph==0.2.70
+langchain-core==0.3.31
+langchain-openai==0.3.1
+langchain-community==0.3.15
+langchain-neo4j==0.3.0
+langchain-qdrant==0.2.0
+
+# Vector DB
+qdrant-client==1.17.0
+
+# Graph DB
+neo4j==5.28.0
+
+# OCR & PDF
+pymupdf==1.25.2
+Pillow==11.1.0
+# arabicOcr doesn't publish wheels for Python 3.12+; keep it optional.
+# The code already falls back to pytesseract when arabicOcr isn't available.
+arabicOcr==1.1.6; python_version < "3.12"
+# Better multilingual OCR (Arabic + English), used before arabicOcr/tesseract.
+easyocr
+
+# NLP / Embeddings
+sentence-transformers==3.4.1
+
+# Redis session store
+redis==5.2.1
+
+# Utilities
+aiofiles==24.1.0
+uuid==1.30
+tenacity==9.0.0
