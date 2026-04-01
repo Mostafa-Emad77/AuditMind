@@ -1,115 +1,111 @@
 # AuditMind
 
-**Bilingual Agentic Financial Document Auditor for Arabic/English Enterprises**
+**Bilingual agentic financial document auditor for Arabic/English workflows**
 
-AuditMind is an AI-powered auditing platform that autonomously analyzes financial documents in Arabic and English, detects cross-document contradictions using a knowledge graph, and streams its full reasoning process in real-time. Built for Egyptian and MENA enterprises dealing with mixed-language financial documents.
+AuditMind analyzes financial PDFs in Arabic and English, cross-checks them with hybrid RAG (vector + graph), and streams agent reasoning to the UI in real time. It targets Egyptian and MENA use cases with mixed-language documents.
 
 ---
 
-## What It Does
+## What it does
 
-Upload invoices, contracts, bank statements, and balance sheets (scanned or digital, Arabic or English). AuditMind:
+Upload invoices, contracts, bank statements, or balance sheets (scanned or digital). AuditMind:
 
-1. **Extracts** text via ArabicOCR + Tesseract (scanned PDFs) or PyMuPDF (digital)
-2. **Builds a knowledge graph** of entities and relationships (Neo4j) + semantic chunks (Qdrant)
-3. **Plans the audit** — generates a targeted checklist based on document types
-4. **Cross-checks** across all documents using hybrid RAG (vector + graph traversal)
-5. **Detects contradictions** — e.g., Invoice says 50,000 EGP, Contract says 45,000 EGP
-6. **Produces a report** in Arabic or English with source citations
-7. **Streams all reasoning** live to a UI panel — like watching a senior auditor think out loud
+1. **Extracts** text — PyMuPDF for digital PDFs; Tesseract (Arabic/English) and optional Arabic OCR for scans  
+2. **Stores** semantic chunks in **Qdrant** and builds an entity graph in **Neo4j**  
+3. **Plans** a targeted audit checklist from document types  
+4. **Cross-checks** across documents via hybrid retrieval and graph traversal  
+5. **Surfaces contradictions** (e.g. amount mismatches) with severity  
+6. **Writes** a structured report in Arabic or English  
+7. **Streams** reasoning steps over **SSE** to the Next.js UI  
 
 ---
 
 ## Architecture
 
 ```
-Documents (PDF/scans)
-        ↓
-[Extraction Agent]           ArabicOCR + Tesseract + PyMuPDF
-  → Qdrant (chunks)          Semantic vector search
-  → Neo4j (knowledge graph)  Entity relationship traversal
-        ↓
-[Audit Planner Agent]        Generates custom checklist per doc combo
-        ↓
-[Cross-Checker Agent]        Hybrid RAG: Qdrant + Neo4j graph traversal
-  → compare_values()         Contradiction detection with severity scoring
-  → search_web()             External verification (company names, rates)
-        ↓
-[Report Writer Agent]        Structured Arabic/English audit report
-        ↓
-[FastAPI + SSE]              Streams reasoning steps to React UI
-        ↓
-[Next.js Frontend]           Live reasoning panel + knowledge graph viz
+PDFs
+  → Extraction (OCR / PyMuPDF)
+      → Qdrant (chunks)     +  Neo4j (entities & relations)
+  → Planner → Cross-checker (hybrid RAG + tools)
+      → Report writer
+  → FastAPI (SSE) → Next.js UI
 ```
 
+**Infra (Docker Compose):** Redis (sessions), Qdrant, FastAPI backend, Next.js frontend. **Neo4j** is external (e.g. [Neo4j Aura](https://neo4j.com/cloud/platform/aura-graph-database/)) — configure `NEO4J_*` in `backend/.env`.
+
 ---
 
-## Tech Stack
+## Tech stack
 
 | Layer | Technology |
-|-------|-----------|
-| Agent framework | LangGraph (multi-agent StateGraph) |
-| LLM | Claude / GPT-4o / Gemini / Groq (configurable) |
-| OCR | ArabicOCR + Tesseract (Arabic + English) |
+|--------|------------|
+| Agents | LangGraph (`StateGraph`) |
+| LLM | [OpenRouter](https://openrouter.ai/) (any supported model slug) |
+| OCR | Tesseract (ara/eng), PyMuPDF; optional Arabic OCR where supported |
 | Vector DB | Qdrant |
-| Graph DB | Neo4j Aura (free tier) |
-| Backend | FastAPI + SSE streaming |
-| Frontend | Next.js 15 + Tailwind CSS + Framer Motion |
-| Containerization | Docker + Docker Compose |
+| Graph DB | Neo4j (Aura or self-hosted) |
+| Cache / sessions | Redis |
+| Backend | FastAPI, SSE |
+| Frontend | Next.js 15, React 19, Tailwind CSS, Framer Motion |
+| Ops | Docker, Docker Compose |
 
 ---
 
-## Getting Started
+## Prerequisites
 
-### Prerequisites
+- **Python 3.11+** (matches `backend/Dockerfile`)  
+- **Node.js 20+**  
+- **Docker** with Compose v2 (`docker compose`)  
+- **Tesseract** with Arabic + English data (handled in the backend Docker image; install locally if you run the API on the host)  
+- **Neo4j** reachable from the backend (Aura free tier is fine)  
+- **OpenRouter** API key  
 
-- Python 3.11+
-- Node.js 20+
-- Docker & Docker Compose
-- Tesseract OCR with Arabic language pack
-- Neo4j Aura account (free tier): https://neo4j.com/cloud/platform/aura-graph-database/
+---
 
-### 1. Clone and configure
+## Getting started
+
+### 1. Clone and configure the backend
 
 ```bash
 cd backend
 cp .env.example .env
-# Edit .env with your API keys
+# Edit .env: OPENROUTER_API_KEY, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, etc.
 ```
 
-Required `.env` values:
+With **Docker Compose**, `QDRANT_URL` and `REDIS_URL` are overridden for the backend container. On your **host**, keep `QDRANT_URL=http://localhost:6333` and `REDIS_URL=redis://localhost:6379` when running Uvicorn outside Compose.
 
-```env
-LLM_PROVIDER=anthropic          # or openai, google, groq
-ANTHROPIC_API_KEY=sk-ant-...
+### 2. Run everything with Docker Compose
 
-NEO4J_URI=neo4j+s://xxx.databases.neo4j.io
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=your-password
-
-QDRANT_URL=http://localhost:6333
-```
-
-### 2. Run with Docker Compose
+From the **repository root**:
 
 ```bash
-docker-compose up --build
+docker compose up --build
 ```
 
-- Frontend: http://localhost:3000
-- Backend API: http://localhost:8000
-- Qdrant dashboard: http://localhost:6333/dashboard
+- Frontend: http://localhost:3000  
+- Backend API: http://localhost:8000  
+- Qdrant dashboard: http://localhost:6333/dashboard  
+- Redis: `localhost:6379`  
 
-### 3. Run locally (development)
+Ensure `backend/.env` exists (Compose loads it via `env_file`) and Neo4j credentials point to a live database.
 
-**Backend:**
+### 3. Local development (without rebuilding images)
+
+**Backend**
+
 ```bash
 cd backend
+python -m venv .venv
+.venv\Scripts\activate          # Windows
+# source .venv/bin/activate     # macOS / Linux
 pip install -r requirements.txt
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-**Frontend:**
+Start Redis and Qdrant (e.g. `docker compose up redis qdrant` from the repo root, or your own instances) and align `QDRANT_URL` / `REDIS_URL` in `.env`.
+
+**Frontend**
+
 ```bash
 cd frontend
 cp .env.local.example .env.local
@@ -119,94 +115,82 @@ npm run dev
 
 ---
 
-## API Reference
+## API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/upload` | POST | Upload PDFs, returns `audit_id` |
-| `/api/audit/{id}/stream` | GET | SSE stream of agent reasoning events |
+| `/health` | GET | Health check (includes Redis reachability when configured) |
+| `/api/upload` | POST | Upload PDFs; returns `audit_id` |
+| `/api/audit/{id}/stream` | GET | SSE stream of agent events |
 | `/api/audit/{id}/report` | GET | Completed audit report (JSON) |
-| `/api/audit/{id}/graph` | GET | Knowledge graph nodes + edges |
-| `/api/audit/{id}/status` | GET | Current audit status |
-| `/health` | GET | Health check |
+| `/api/audit/{id}/graph` | GET | Knowledge graph (query: `center_node`, `depth`, `view`) |
+| `/api/audit/{id}/status` | GET | Session status and document list |
+| `/api/documents/{doc_id}` | GET | Single document metadata |
 
-### SSE Event Types
+### SSE event shapes (simplified)
 
-```typescript
-type SSEEvent =
-  | { type: "connected"; audit_id: string }
-  | { type: "reasoning_step"; step: ReasoningStep }
-  | { type: "report_ready"; overall_risk: string; finding_count: number }
-  | { type: "complete"; audit_id: string }
-  | { type: "error"; message: string }
-```
+Events are JSON objects in SSE `data:` lines. Common `type` values:
 
----
-
-## LLM Provider Configuration
-
-Switch providers with zero code changes via environment variable:
-
-```env
-LLM_PROVIDER=anthropic   # claude-3-5-sonnet-20241022
-LLM_PROVIDER=openai      # gpt-4o
-LLM_PROVIDER=google      # gemini-2.0-flash
-LLM_PROVIDER=groq        # llama-3.3-70b-versatile
-```
-
-Override specific model:
-```env
-LLM_MODEL=claude-3-opus-20240229
-```
+- `connected` — includes `audit_id`, `document_count`  
+- `reasoning_step` — includes `step` (agent/tool trace)  
+- `report_ready` — includes `overall_risk`, `finding_count`  
+- `complete` — audit finished  
+- `error` — failure message  
 
 ---
 
-## Project Structure
+## Configuration (backend)
+
+Settings come from `backend/.env` and map to `app/config.py`. Important variables:
+
+| Variable | Purpose |
+|----------|---------|
+| `OPENROUTER_API_KEY` | Required for LLM calls |
+| `OPENROUTER_MODEL` | Model slug (default in code: `google/gemini-3-flash-preview`) |
+| `OPENROUTER_REASONING` | `true` / `false` — reasoning payload for supported models |
+| `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `NEO4J_DATABASE` | Graph database |
+| `QDRANT_URL`, `QDRANT_API_KEY` (if applicable) | Vector store |
+| `REDIS_URL` | Session / report storage |
+| `CORS_ORIGINS` | Comma-separated browser origins |
+
+Frontend URL for API calls: `NEXT_PUBLIC_API_URL` in `frontend/.env.local` (defaults to `http://localhost:8000` in code).
+
+---
+
+## Repository layout
 
 ```
 AuditMind/
 ├── backend/
 │   ├── app/
-│   │   ├── main.py              # FastAPI app + SSE endpoints
-│   │   ├── config.py            # Pydantic Settings
+│   │   ├── main.py                 # FastAPI + SSE
+│   │   ├── config.py               # Settings (OpenRouter, Neo4j, Qdrant, Redis)
 │   │   ├── agents/
-│   │   │   ├── graph.py         # Master LangGraph StateGraph
-│   │   │   ├── extraction.py    # Extraction Agent
-│   │   │   ├── planner.py       # Audit Planner Agent
-│   │   │   ├── cross_checker.py # Cross-Checker Agent (core)
-│   │   │   └── report_writer.py # Report Writer Agent
-│   │   ├── tools/               # @tool decorated functions
-│   │   │   ├── hybrid_retriever.py  # Qdrant + Neo4j combined
-│   │   │   ├── financial.py         # Amount extraction & comparison
-│   │   │   ├── neo4j_tools.py       # Graph traversal tools
-│   │   │   └── web_search.py        # External verification
-│   │   ├── services/
-│   │   │   ├── document_processor.py  # PDF → OCR → chunks
-│   │   │   ├── entity_extractor.py    # LLM entity extraction
-│   │   │   ├── graph_builder.py       # Neo4j graph operations
-│   │   │   └── vector_store.py        # Qdrant operations
+│   │   │   ├── graph.py            # LangGraph pipeline
+│   │   │   ├── extraction.py
+│   │   │   ├── planner.py
+│   │   │   ├── cross_checker.py
+│   │   │   └── report_writer.py
+│   │   ├── tools/                  # hybrid_retriever, neo4j_tools, qdrant_tools, …
+│   │   ├── services/               # document_processor, vector_store, graph_builder, redis_store, …
+│   │   ├── models/
 │   │   └── utils/
-│   │       ├── arabic_normalizer.py   # Arabic text normalization
-│   │       └── llm_factory.py         # Multi-provider LLM factory
-│   └── requirements.txt
+│   ├── tests/
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   └── .env.example
 ├── frontend/
-│   └── src/
-│       ├── app/
-│       │   ├── page.tsx              # Upload / landing page
-│       │   └── audit/[id]/page.tsx   # Audit session page
-│       ├── components/
-│       │   ├── ReasoningPanel.tsx    # Live agent reasoning UI
-│       │   ├── FindingsTable.tsx     # Severity-sorted findings
-│       │   ├── AuditReport.tsx       # Final report display
-│       │   ├── KnowledgeGraph.tsx    # Interactive graph canvas
-│       │   └── FileUpload.tsx        # Drag-and-drop uploader
-│       └── hooks/
-│           └── useAuditStream.ts     # SSE consumer hook
+│   ├── src/
+│   │   ├── app/                    # Next.js App Router
+│   │   ├── components/             # ReasoningPanel, FindingsTable, AuditReport, ReconciliationPanel, …
+│   │   └── hooks/                  # useAuditStream (SSE)
+│   ├── Dockerfile
+│   └── .env.local.example
 └── docker-compose.yml
 ```
 
 ---
 
-## CV Summary
+## One-line pitch (resume / portfolio)
 
-> "Built AuditMind, a bilingual agentic financial auditor using LangGraph and Claude API. Implemented cross-document contradiction detection across Arabic/English PDFs using Qdrant vector search + Neo4j GraphRAG, ArabicOCR, and a live chain-of-thought reasoning UI built in Next.js. The system autonomously detects amount mismatches, party inconsistencies, and date conflicts across mixed-language document sets."
+> Bilingual agentic financial auditor: LangGraph + OpenRouter, hybrid RAG (Qdrant + Neo4j), OCR for Arabic/English PDFs, FastAPI SSE, Next.js reasoning UI.
