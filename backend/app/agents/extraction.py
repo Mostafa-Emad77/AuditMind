@@ -11,7 +11,6 @@ from app.models.schemas import ReasoningStep, DocumentChunk, DocumentMeta
 from app.services.entity_extractor import extract_entities_from_chunks
 from app.services.vector_store import semantic_search
 from app.services.graph_builder import (
-    init_graph_schema,
     store_document_node,
     store_entities,
     store_relationships,
@@ -141,16 +140,9 @@ async def extraction_agent(state: AuditState) -> dict:
     step = _emit(writer, "extraction", "thought", overview)
     new_steps.append(step)
 
-    # Initialize Neo4j schema
-    try:
-        init_graph_schema()
-        step = _emit(writer, "extraction", "thought", "Neo4j schema initialized. Building knowledge graph...")
-        new_steps.append(step)
-    except Exception as e:
-        logger.warning("Neo4j schema init failed (non-fatal): %s", e)
-        step = _emit(writer, "extraction", "thought",
-                     f"Note: Neo4j connection issue ({e}). Graph features will be limited.")
-        new_steps.append(step)
+    # Neo4j schema is initialized once at app startup (see main.py lifespan).
+    step = _emit(writer, "extraction", "thought", "Building knowledge graph from documents...")
+    new_steps.append(step)
 
     all_entities = []
     all_relationships = []
@@ -219,6 +211,10 @@ async def extraction_agent(state: AuditState) -> dict:
             relationships_so_far: int,
             chunk: DocumentChunk,
         ) -> None:
+            # Throttle: emit only every 10th chunk (and the final one) to avoid
+            # flooding the SSE stream on large documents.
+            if processed % 10 != 0 and processed != total:
+                return
             progress_step = _emit(
                 writer,
                 "extraction",

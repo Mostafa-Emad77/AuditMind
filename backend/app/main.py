@@ -1,5 +1,6 @@
 """AuditMind FastAPI application — main entry point."""
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -21,7 +22,7 @@ from app.models.schemas import (
     UploadResponse,
 )
 from app.services.document_processor import ingest_document
-from app.services.graph_builder import close_driver, get_entity_graph
+from app.services.graph_builder import close_driver, get_entity_graph, init_graph_schema
 from app.services.redis_store import (
     close_redis,
     find_document,
@@ -49,6 +50,13 @@ async def lifespan(app: FastAPI):
         await get_redis()
     except Exception as e:
         logger.warning("Redis connection failed on startup: %s — will retry on first request.", e)
+    # Initialize the Neo4j graph schema once at boot (was previously re-run per audit).
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, init_graph_schema)
+        logger.info("Neo4j schema initialized.")
+    except Exception as e:
+        logger.warning("Neo4j schema init failed on startup (non-fatal): %s", e)
     yield
     logger.info("AuditMind API shutting down...")
     await close_redis()
@@ -294,7 +302,14 @@ async def get_graph(
 
     doc_ids = [d.doc_id for d in session.documents]
     try:
-        return get_entity_graph(doc_ids, center_node=center_node, depth=depth, view=view)
+        # get_entity_graph uses the sync Neo4j driver — offload so it doesn't block the event loop.
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            functools.partial(
+                get_entity_graph, doc_ids, center_node=center_node, depth=depth, view=view
+            ),
+        )
     except Exception as e:
         logger.error("Failed to retrieve graph for audit %s: %s", audit_id, e)
         raise HTTPException(status_code=500, detail=f"Graph retrieval failed: {str(e)}")

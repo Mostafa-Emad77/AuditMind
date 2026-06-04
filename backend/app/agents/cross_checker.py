@@ -772,6 +772,11 @@ async def cross_checker_agent(state: AuditState) -> dict:
         new_steps.append(step)
 
     # ── Phase 2: Checklist-driven semantic checks ─────────────────────────────
+    # Pre-fetch all bank-statement chunks once; every bank-reconciliation check below
+    # augments its results with the same full set, so re-fetching per item is wasteful.
+    bank_doc_ids = [d.doc_id for d in documents if _is_bank_doc(d)]
+    full_bank_chunks = get_all_chunks_for_docs(bank_doc_ids) if bank_doc_ids else []
+
     for i, item in enumerate(checklist):
         step = _emit(writer, "thought",
                      f"[{i+1}/{len(checklist)}] {item.description} [{item.priority.upper()} priority]")
@@ -804,18 +809,13 @@ async def cross_checker_agent(state: AuditState) -> dict:
             search_data = json.loads(search_raw)
             results = search_data.get("results", [])
 
-            if is_bank_recon:
-                bank_doc_ids = [
-                    d.doc_id for d in documents if _is_bank_doc(d)
-                ]
-                if bank_doc_ids:
-                    full_bank_chunks = get_all_chunks_for_docs(bank_doc_ids)
-                    existing_texts = {r.get("text", "")[:100] for r in results}
-                    for chunk in full_bank_chunks:
-                        key = (chunk.get("text") or "")[:100]
-                        if key and key not in existing_texts:
-                            existing_texts.add(key)
-                            results.append(chunk)
+            if is_bank_recon and full_bank_chunks:
+                existing_texts = {r.get("text", "")[:100] for r in results}
+                for chunk in full_bank_chunks:
+                    key = (chunk.get("text") or "")[:100]
+                    if key and key not in existing_texts:
+                        existing_texts.add(key)
+                        results.append(chunk)
 
             step = _emit(writer, "tool_result",
                          f"Found {len(results)} relevant passages "
@@ -943,20 +943,25 @@ async def cross_checker_agent(state: AuditState) -> dict:
     )
 
     # ── Phase 4: Deduplicate findings ──────────────────────────────────────────
+    # Pre-compute each finding's dedup signature once; the pairwise loop below is O(n²)
+    # and previously recomputed topic/numeric/ref signatures on every comparison.
+    def _dedup_signature(f: Finding) -> tuple[str, set, set, set]:
+        return (
+            _finding_topic_bucket(f),
+            set(_finding_numeric_signature(f)),
+            set(filter(None, [f.source_doc_id, f.conflicting_doc_id])),
+            _finding_ref_signature(f),
+        )
+
+    finding_sigs = [_dedup_signature(f) for f in findings]
+
     deduped: list[Finding] = []
-    for f in findings:
-        f_topic = _finding_topic_bucket(f)
-        f_sig = set(_finding_numeric_signature(f))
-        f_docs = set(filter(None, [f.source_doc_id, f.conflicting_doc_id]))
-        f_refs = _finding_ref_signature(f)
-
+    deduped_sigs: list[tuple[str, set, set, set]] = []
+    for f, (f_topic, f_sig, f_docs, f_refs) in zip(findings, finding_sigs):
         merged = False
-        for idx, prev in enumerate(deduped):
-            p_topic = _finding_topic_bucket(prev)
-            p_sig = set(_finding_numeric_signature(prev))
-            p_docs = set(filter(None, [prev.source_doc_id, prev.conflicting_doc_id]))
-            p_refs = _finding_ref_signature(prev)
-
+        for idx, (prev, (p_topic, p_sig, p_docs, p_refs)) in enumerate(
+            zip(deduped, deduped_sigs)
+        ):
             is_dup = False
 
             if (
@@ -986,12 +991,14 @@ async def cross_checker_agent(state: AuditState) -> dict:
             if is_dup:
                 if _prefer_finding(f, prev):
                     deduped[idx] = f
+                    deduped_sigs[idx] = (f_topic, f_sig, f_docs, f_refs)
                 merged = True
                 logger.debug("Deduped finding %r (duplicate of %r)", f.title, prev.title)
                 break
 
         if not merged:
             deduped.append(f)
+            deduped_sigs.append((f_topic, f_sig, f_docs, f_refs))
 
     if len(deduped) < len(findings):
         logger.info("Deduplicated findings: %d → %d", len(findings), len(deduped))

@@ -1,3 +1,4 @@
+from functools import lru_cache
 from typing import Literal
 
 from langchain_core.language_models import BaseChatModel
@@ -27,12 +28,17 @@ def _get_google_llm(role: OpenRouterRole | None, temperature: float) -> BaseChat
     )
 
 
+@lru_cache(maxsize=None)
 def get_llm(
     temperature: float = 0.0,
     role: OpenRouterRole | None = None,
 ) -> BaseChatModel:
     """
     Return the configured LLM instance.
+
+    Cached on (temperature, role): the underlying clients are stateless and settings
+    are fixed for the process lifetime, so we build each distinct client once instead
+    of re-instantiating it on every call.
 
     When LLM_PROVIDER=google, uses Google AI Studio (Gemini) via langchain-google-genai.
     When LLM_PROVIDER=openrouter (default), uses OpenRouter via ChatOpenAI.
