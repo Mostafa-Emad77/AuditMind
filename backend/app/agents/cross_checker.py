@@ -16,6 +16,7 @@ from app.utils.money_parse import parse_monetary_amount, amounts_within_tiny_tol
 from app.services.vector_store import get_all_chunks_for_docs
 from app.utils.llm_factory import get_llm
 from app.utils.text_amount_scan import amounts_from_text_scan
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,7 @@ def _extract_json_obj(text: str) -> dict | None:
     return None
 
 
-def _llm_assess_amount_pair(
+async def _llm_assess_amount_pair(
     value1: str,
     value2: str,
     context: str,
@@ -85,7 +86,7 @@ def _llm_assess_amount_pair(
     Ask LLM if a pair is a meaningful contradiction (like-with-like only).
     Returns structured decision dict or None on failure.
     """
-    llm = get_llm(temperature=0.0)
+    llm = get_llm(temperature=0.0, role="relation")
     prompt = (
         "You are a forensic audit checker. Decide if two numeric values are a REAL contradiction.\n"
         "You MUST reject apples-to-oranges comparisons.\n\n"
@@ -112,7 +113,7 @@ def _llm_assess_amount_pair(
         "}\n"
     )
     try:
-        resp = llm.invoke(prompt)
+        resp = await llm.ainvoke(prompt)
         content = resp.content if hasattr(resp, "content") else str(resp)
         if isinstance(content, list):
             content = "".join(
@@ -138,7 +139,7 @@ def _llm_assess_amount_pair(
         return None
 
 
-def _llm_adjudicate_check(
+async def _llm_adjudicate_check(
     item: ChecklistItem,
     results: list[dict],
     documents: list[Any],
@@ -175,7 +176,7 @@ def _llm_adjudicate_check(
     if len(snippets) < 2:
         return []
 
-    llm = get_llm(temperature=0.0)
+    llm = get_llm(temperature=0.0, role="relation")
     prompt = (
         "You are a strict financial audit reviewer.\n"
         "Analyze the checklist check against document snippets and output ONLY real findings.\n"
@@ -214,7 +215,7 @@ def _llm_adjudicate_check(
         "If no reliable finding, return {\"findings\": []}."
     )
     try:
-        resp = llm.invoke(prompt)
+        resp = await llm.ainvoke(prompt)
         content = resp.content if hasattr(resp, "content") else str(resp)
         if isinstance(content, list):
             content = "".join(
@@ -451,8 +452,23 @@ def _amount_for_dedup_signature(p: float) -> bool:
     return True
 
 
+def _canonical_amount(raw_value: float) -> float:
+    """
+    Normalize an amount to a coarse bucket for dedup matching.
+    Values < 10k round to nearest 100, >= 10k round to nearest 1000.
+    This absorbs minor OCR/rounding variations while keeping distinct amounts separate.
+    """
+    if raw_value < 10_000:
+        return round(raw_value / 100) * 100
+    return round(raw_value / 1_000) * 1_000
+
+
 def _finding_numeric_signature(f: Finding) -> tuple[float, ...]:
-    """Stable amount set from title + description only (evidence would add noisy balance columns)."""
+    """
+    Stable canonicalized amount set from title + description only.
+    Evidence columns are excluded to avoid noisy balance/running-total lines
+    creating unique signatures for what is actually the same audit story.
+    """
     text = f"{f.title}\n{f.description or ''}"
     nums: list[float] = []
     for amt in extract_amounts(text):
@@ -464,10 +480,10 @@ def _finding_numeric_signature(f: Finding) -> tuple[float, ...]:
             except (TypeError, ValueError):
                 p = None
         if p is not None and _amount_for_dedup_signature(p):
-            nums.append(round(p, -2))
+            nums.append(_canonical_amount(p))
     for p in amounts_from_text_scan(text, min_value=1000):
         if _amount_for_dedup_signature(p):
-            nums.append(round(p, -2))
+            nums.append(_canonical_amount(p))
     return tuple(sorted(set(nums)))
 
 
@@ -486,6 +502,66 @@ def _prefer_finding(candidate: Finding, incumbent: Finding) -> bool:
     if cr < ir:
         return False
     return candidate.confidence_score > incumbent.confidence_score
+
+
+def _accept_finding(
+    finding: Finding,
+    *,
+    source: str = "llm",
+    min_evidence_for_critical: int = 2,
+    min_confidence_llm: float = 0.65,
+    min_confidence_graph: float = 0.55,
+) -> tuple[bool, str]:
+    """
+    Centralized precision-first acceptance gate for all finding paths.
+
+    Args:
+        finding: The candidate Finding to evaluate.
+        source: "llm" for LLM-adjudicated, "graph" for graph-contradiction, "detector" for rule-based.
+        min_evidence_for_critical: Min distinct evidence snippets required for critical LLM findings.
+        min_confidence_llm: Min confidence for LLM-sourced findings.
+        min_confidence_graph: Min confidence for graph-sourced findings.
+
+    Returns:
+        (accepted: bool, rejection_reason: str)
+        rejection_reason is empty string if accepted.
+    """
+    # ok-severity findings are observational — always let through
+    if finding.severity == "ok":
+        return True, ""
+
+    # Confidence floor per source
+    if source == "llm":
+        min_conf = min_confidence_llm
+    elif source == "graph":
+        min_conf = min_confidence_graph
+    else:
+        # rule-based / detector findings are trusted; only a minimal floor
+        min_conf = 0.40
+
+    if finding.confidence_score < min_conf:
+        return False, (
+            f"low_confidence(score={finding.confidence_score:.2f} < floor={min_conf:.2f}, source={source})"
+        )
+
+    # Critical LLM findings need corroboration from at least 2 distinct evidence snippets
+    if source == "llm" and finding.severity == "critical":
+        distinct_ev = len([e for e in finding.evidence if e.strip()])
+        if distinct_ev < min_evidence_for_critical:
+            return False, (
+                f"insufficient_evidence(count={distinct_ev} < required={min_evidence_for_critical}, critical)"
+            )
+
+    # Graph findings that are critical must still pass the evidence-backs-value check
+    # (already done inline for graph phase, so this is a belt-and-suspenders check)
+    if source == "graph" and finding.severity == "critical":
+        distinct_ev = len([e for e in finding.evidence if e.strip()])
+        if distinct_ev < 2:
+            return False, (
+                f"insufficient_graph_evidence(count={distinct_ev} < 2, critical)"
+            )
+
+    return True, ""
 
 
 def _graph_context_for_compare(c: dict, doc1: str, doc2: str) -> str:
@@ -507,50 +583,47 @@ def _is_bank_doc(doc: Any) -> bool:
     return dt == "bank_statement" or any(k in fn for k in ("bank", "statement", "stmt"))
 
 
+# Rule-based intent classification keyword sets (no LLM — check_type already encodes
+# most of the intent, and the only consumer is the bank-reconciliation branch below).
+_BANK_RECON_KEYWORDS = (
+    "bank", "statement", "reconcil", "payment", "paid", "transfer",
+    "disbursement", "remittance", "deposit", "debit", "credit", "transaction",
+    "بنك", "تحويل", "دفع", "سداد", "كشف",
+)
+_INVOICE_KEYWORDS = ("invoice", "billed", "billing", "فاتورة")
+_MILESTONE_KEYWORDS = ("milestone", "installment", "دفعة", "مرحلة")
+_SCHEDULE_KEYWORDS = ("schedule", "due date", "payment date", "مواعيد", "جدول")
+
+
 def _classify_check_intents(description: str, check_type: str) -> set[str]:
     """
-    LLM-based checklist intent classification.
+    Rule-based checklist intent classification (no LLM call).
+
+    ``check_type`` already encodes the intent and the only downstream consumer of the
+    returned set is the ``is_bank_recon`` branch in :func:`cross_checker_agent`, so we
+    derive the intents deterministically from ``check_type`` + keywords instead of
+    spending an LLM call per checklist item.
+
     Returns a set of intents among:
       schedule, subtotal, bank_contract_recon, invoice_bank_recon, milestone_bank_recon, generic
     """
-    prompt = (
-        "Classify this audit checklist item into one or more intents.\n"
-        "Allowed intents: schedule, subtotal, bank_contract_recon, invoice_bank_recon, milestone_bank_recon, generic.\n"
-        "Return JSON only:\n"
-        "{\n"
-        '  "intents": ["intent1", "intent2"]\n'
-        "}\n\n"
-        f"description: {description}\n"
-        f"check_type: {check_type}\n"
-    )
-    try:
-        llm = get_llm(temperature=0.0)
-        resp = llm.invoke(prompt)
-        content = resp.content if hasattr(resp, "content") else str(resp)
-        if isinstance(content, list):
-            content = "".join(
-                c.get("text", "") if isinstance(c, dict) else str(c)
-                for c in content
-            )
-        data = _extract_json_obj(str(content)) or {}
-        intents = data.get("intents", [])
-        if isinstance(intents, list):
-            valid = {
-                "schedule",
-                "subtotal",
-                "bank_contract_recon",
-                "invoice_bank_recon",
-                "milestone_bank_recon",
-                "generic",
-            }
-            out = {str(i).strip().lower() for i in intents if str(i).strip().lower() in valid}
-            if out:
-                return out
-    except Exception as e:
-        logger.debug("LLM intent classification failed: %s", e)
+    blob = f"{description} {check_type}".lower()
+    intents: set[str] = set()
 
-    # LLM failed; default to generic adjudication only.
-    return {"generic"}
+    is_amountish = check_type in ("amount_match", "cross_doc_consistency")
+    if is_amountish and any(k in blob for k in _BANK_RECON_KEYWORDS):
+        intents.add("bank_contract_recon")
+        if any(k in blob for k in _INVOICE_KEYWORDS):
+            intents.add("invoice_bank_recon")
+        if any(k in blob for k in _MILESTONE_KEYWORDS):
+            intents.add("milestone_bank_recon")
+
+    if check_type == "date_consistency" or any(k in blob for k in _SCHEDULE_KEYWORDS):
+        intents.add("schedule")
+
+    if not intents:
+        intents.add("generic")
+    return intents
 
 
 async def cross_checker_agent(state: AuditState) -> dict:
@@ -565,6 +638,16 @@ async def cross_checker_agent(state: AuditState) -> dict:
     checklist = state.get("checklist", [])
     doc_ids = [doc.doc_id for doc in documents]
     doc_ids_str = ",".join(doc_ids)
+
+    settings = get_settings()
+    _gate_kwargs = dict(
+        min_evidence_for_critical=settings.finding_min_evidence_for_critical,
+        min_confidence_llm=settings.finding_min_confidence_llm,
+        min_confidence_graph=settings.finding_min_confidence_graph,
+    )
+    # Track candidate vs accepted counts for observability
+    _candidates_total = 0
+    _accepted_total = 0
 
     step = _emit(writer, "thought",
                  f"Starting cross-document analysis. "
@@ -611,7 +694,7 @@ async def cross_checker_agent(state: AuditState) -> dict:
                 pair_ctx = _graph_context_for_compare(c, doc1, doc2)
 
                 # LLM first: validate that this is a meaningful like-with-like comparison.
-                llm_pair = _llm_assess_amount_pair(
+                llm_pair = await _llm_assess_amount_pair(
                     raw1, raw2, pair_ctx, [ev1, ev2]
                 )
                 if not llm_pair:
@@ -642,13 +725,7 @@ async def cross_checker_agent(state: AuditState) -> dict:
                             "against cited snippets; treating as non-critical. " + explanation
                         )
 
-                    step = _emit(writer, "finding",
-                                 f"CONTRADICTION DETECTED: {raw1} vs {raw2}\n"
-                                 f"Source: {doc1} (p.{page1}) ↔ {doc2} (p.{page2})\n"
-                                 f"Severity: {severity.upper()} | Confidence: {confidence:.0%}")
-                    new_steps.append(step)
-
-                    findings.append(Finding(
+                    candidate = Finding(
                         severity=severity,
                         title=f"Amount Contradiction: {raw1} vs {raw2}",
                         description=explanation,
@@ -659,7 +736,29 @@ async def cross_checker_agent(state: AuditState) -> dict:
                         conflicting_page=page2,
                         evidence=[ev1, ev2],
                         recommendation="Verify the correct amount with the contracting parties and request a corrected document.",
-                    ))
+                    )
+                    _candidates_total += 1
+                    accepted, rejection_reason = _accept_finding(
+                        candidate, source="graph", **_gate_kwargs
+                    )
+                    if accepted:
+                        _accepted_total += 1
+                        step = _emit(writer, "finding",
+                                     f"CONTRADICTION DETECTED: {raw1} vs {raw2}\n"
+                                     f"Source: {doc1} (p.{page1}) ↔ {doc2} (p.{page2})\n"
+                                     f"Severity: {severity.upper()} | Confidence: {confidence:.0%}")
+                        new_steps.append(step)
+                        findings.append(candidate)
+                    else:
+                        logger.info(
+                            "Gate rejected graph finding %r: %s",
+                            candidate.title[:60],
+                            rejection_reason,
+                        )
+                        step = _emit(writer, "thought",
+                                     f"Graph finding filtered out (precision gate: {rejection_reason}): "
+                                     f"{raw1} vs {raw2}")
+                        new_steps.append(step)
         else:
             step = _emit(writer, "tool_result",
                          "No direct graph contradictions found. Proceeding with semantic checks.",
@@ -729,11 +828,18 @@ async def cross_checker_agent(state: AuditState) -> dict:
             # LLM-only adjudication over extracted snippets.
             if item.check_type in ("amount_match", "cross_doc_consistency") and len(item_doc_ids) > 1:
                 llm_cap = 1 if is_bank_recon else 4
-                llm_findings = _llm_adjudicate_check(
+                llm_findings = await _llm_adjudicate_check(
                     item, results, documents, max_findings=llm_cap
                 )
-                if llm_findings:
-                    for lf in llm_findings:
+                accepted_here = 0
+                for lf in llm_findings:
+                    _candidates_total += 1
+                    accepted, rejection_reason = _accept_finding(
+                        lf, source="llm", **_gate_kwargs
+                    )
+                    if accepted:
+                        _accepted_total += 1
+                        accepted_here += 1
                         findings.append(lf)
                         step = _emit(
                             writer,
@@ -741,7 +847,17 @@ async def cross_checker_agent(state: AuditState) -> dict:
                             f"LLM finding: {lf.title} — {lf.severity.upper()}",
                         )
                         new_steps.append(step)
-                else:
+                    else:
+                        logger.info(
+                            "Gate rejected LLM amount finding %r: %s",
+                            lf.title[:60],
+                            rejection_reason,
+                        )
+                        step = _emit(writer, "thought",
+                                     f"LLM finding filtered out (precision gate: {rejection_reason}): "
+                                     f"{lf.title[:80]}")
+                        new_steps.append(step)
+                if not llm_findings or accepted_here == 0:
                     step = _emit(
                         writer,
                         "thought",
@@ -750,9 +866,16 @@ async def cross_checker_agent(state: AuditState) -> dict:
                     new_steps.append(step)
 
             elif item.check_type == "date_consistency":
-                llm_findings = _llm_adjudicate_check(item, results, documents)
-                if llm_findings:
-                    for lf in llm_findings:
+                llm_findings = await _llm_adjudicate_check(item, results, documents)
+                accepted_here = 0
+                for lf in llm_findings:
+                    _candidates_total += 1
+                    accepted, rejection_reason = _accept_finding(
+                        lf, source="llm", **_gate_kwargs
+                    )
+                    if accepted:
+                        _accepted_total += 1
+                        accepted_here += 1
                         findings.append(lf)
                         step = _emit(
                             writer,
@@ -760,7 +883,17 @@ async def cross_checker_agent(state: AuditState) -> dict:
                             f"LLM date finding: {lf.title} — {lf.severity.upper()}",
                         )
                         new_steps.append(step)
-                else:
+                    else:
+                        logger.info(
+                            "Gate rejected LLM date finding %r: %s",
+                            lf.title[:60],
+                            rejection_reason,
+                        )
+                        step = _emit(writer, "thought",
+                                     f"LLM date finding filtered out (precision gate: {rejection_reason}): "
+                                     f"{lf.title[:80]}")
+                        new_steps.append(step)
+                if not llm_findings or accepted_here == 0:
                     step = _emit(writer, "thought", "LLM date review found no reliable inconsistency.")
                     new_steps.append(step)
 
@@ -800,6 +933,14 @@ async def cross_checker_agent(state: AuditState) -> dict:
                 new_steps.append(step)
             except Exception as e:
                 logger.debug("Web search failed: %s", e)
+
+    # ── Precision gate observability ──────────────────────────────────────────
+    logger.info(
+        "Precision gate summary: %d candidates → %d accepted (%.0f%% pass rate)",
+        _candidates_total,
+        _accepted_total,
+        (_accepted_total / _candidates_total * 100) if _candidates_total else 0.0,
+    )
 
     # ── Phase 4: Deduplicate findings ──────────────────────────────────────────
     deduped: list[Finding] = []

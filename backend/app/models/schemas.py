@@ -57,6 +57,11 @@ class Entity(BaseModel):
     western_numeral_form: Optional[str] = None
     arabic_indic_numeral_form: Optional[str] = None
     numeral_mismatch: Optional[bool] = None
+    # Deterministic numeric parse for amount entities (set by entity_extractor; never by LLM).
+    # When populated, downstream contradiction logic compares numerically with tolerance
+    # instead of doing string-equality on `normalized_value`.
+    amount_value: Optional[float] = None
+    amount_currency: Optional[str] = None
 
 
 class Relationship(BaseModel):

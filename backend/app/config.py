@@ -1,21 +1,57 @@
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import Field, field_validator
 from functools import lru_cache
 from typing import Optional
 
 
 class Settings(BaseSettings):
+    # LLM provider: "openrouter" (default) or "google"
+    llm_provider: str = Field(
+        default="openrouter",
+        description="Which LLM backend to use: 'openrouter' or 'google'",
+    )
+
     # LLM — OpenRouter
     openrouter_api_key: str = Field(default="")
     openrouter_base_url: str = Field(default="https://openrouter.ai/api/v1")
     openrouter_model: str = Field(
-        default="google/gemini-3-flash-preview",
+        default="openai/gpt-oss-20b:nitro",
         description="Any model slug from https://openrouter.ai/models",
+    )
+    openrouter_model_ner_arabic: str = Field(
+        default="qwen/qwen3-32b",
+        description="NER / entity extraction only; never substituted by OPENROUTER_MODEL",
+    )
+    openrouter_model_relation: str = Field(
+        default="anthropic/claude-sonnet-4.6",
+        description="Cross-checker / contradiction logic only; never substituted by OPENROUTER_MODEL",
     )
     openrouter_reasoning: bool = Field(
         default=True,
         description="Pass reasoning:{enabled:true} — supported by minimax-m2.5 and other reasoning models",
     )
+
+    # LLM — Google AI Studio (Gemini)
+    google_api_key: str = Field(default="", description="Google AI Studio API key")
+    google_model: str = Field(
+        default="gemini-2.5-pro",
+        description="Default Gemini model for general / planning / report tasks",
+    )
+    google_model_ner_arabic: str = Field(
+        default="gemini-2.5-pro",
+        description="Gemini model used for NER / entity extraction",
+    )
+    google_model_relation: str = Field(
+        default="gemini-2.5-pro",
+        description="Gemini model used for cross-checker / contradiction logic",
+    )
+
+    @field_validator("openrouter_model_ner_arabic", "openrouter_model_relation", mode="before")
+    @classmethod
+    def _stage_model_slugs_non_empty(cls, v: object) -> object:
+        if isinstance(v, str) and not v.strip():
+            raise ValueError("OpenRouter stage model slug must be non-empty")
+        return v
 
     # Qdrant
     qdrant_url: str = Field(default="http://localhost:6333")
@@ -40,6 +76,48 @@ class Settings(BaseSettings):
     redis_url: str = Field(
         default="redis://localhost:6379",
         description="Redis Cloud URL — redis://:[password]@[host]:[port]",
+    )
+
+    # Extraction speed — concurrency and pacing
+    extraction_concurrency: int = Field(
+        default=3,
+        description="Max parallel LLM NER calls during extraction (paid tier: 3+; free tier: 1)",
+    )
+    extraction_chunk_sleep: float = Field(
+        default=0.0,
+        description="Seconds to sleep between extraction batches (0 for paid tier; 4.0 for free tier)",
+    )
+
+    # Extraction recall — adaptive retrieval
+    extraction_top_k_base: int = Field(
+        default=50,
+        description="Base top_k for extraction queries on small docs (<=5 pages)",
+    )
+    extraction_top_k_max: int = Field(
+        default=80,
+        description="Hard cap on merged chunks passed to entity extraction per document",
+    )
+    extraction_chunk_cap: Optional[int] = Field(
+        default=None,
+        description=(
+            "Optional hard cap inside the entity extractor on top of the upstream retrieval "
+            "limit. None = no extra cap (recommended); upstream extraction_top_k_max is the "
+            "single source of truth. Set to a small int (e.g. 15) to restore legacy free-tier behaviour."
+        ),
+    )
+
+    # Cross-checker precision gates
+    finding_min_evidence_for_critical: int = Field(
+        default=2,
+        description="Minimum distinct evidence snippets required to emit a critical finding from LLM adjudication",
+    )
+    finding_min_confidence_llm: float = Field(
+        default=0.65,
+        description="Minimum confidence score for LLM-only adjudicated findings to be accepted",
+    )
+    finding_min_confidence_graph: float = Field(
+        default=0.55,
+        description="Minimum confidence score for graph-sourced findings to be accepted",
     )
 
     # App

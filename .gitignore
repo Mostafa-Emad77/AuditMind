@@ -37,3 +37,7 @@ Thumbs.db
 
 # IDE
 .idea/
+
+# Local test data
+Test Data/
+PERFORMANCE_REVIEW.md

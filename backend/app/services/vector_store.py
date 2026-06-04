@@ -1,5 +1,4 @@
 """Qdrant vector store operations for AuditMind."""
-import uuid
 import logging
 from typing import Optional
 
@@ -11,12 +10,16 @@ from qdrant_client.models import (
     Filter,
     FieldCondition,
     MatchValue,
+    MatchText,
     PayloadSchemaType,
+    TextIndexParams,
+    TokenizerType,
 )
 from sentence_transformers import SentenceTransformer
 
 from app.config import get_settings
 from app.models.schemas import DocumentChunk
+from app.utils.canonical_id import canonical_chunk_point_id
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,23 @@ def ensure_collection(client: QdrantClient, collection_name: str, vector_size: i
         field_name="language",
         field_schema=PayloadSchemaType.KEYWORD,
     )
+    # Full-text index on chunk text — enables keyword_search() for exact-token
+    # lookup of contract / invoice IDs that dense embeddings tend to miss.
+    try:
+        client.create_payload_index(
+            collection_name=collection_name,
+            field_name="text",
+            field_schema=TextIndexParams(
+                type="text",
+                tokenizer=TokenizerType.MULTILINGUAL,
+                min_token_len=2,
+                max_token_len=64,
+                lowercase=True,
+            ),
+        )
+    except Exception as exc:
+        # Older Qdrant versions or unsupported tokenizer settings — non-fatal.
+        logger.debug("Text payload index create skipped: %s", exc)
 
 
 def store_chunks(chunks: list[DocumentChunk]) -> int:
@@ -78,9 +98,12 @@ def store_chunks(chunks: list[DocumentChunk]) -> int:
 
     points = []
     for chunk, embedding in zip(chunks, embeddings):
+        # Deterministic point ID — re-uploading the same doc upserts in place
+        # instead of creating duplicate vector points.
+        point_id = canonical_chunk_point_id(chunk.doc_id, chunk.chunk_index)
         points.append(
             PointStruct(
-                id=str(uuid.uuid4()),
+                id=point_id,
                 vector=embedding.tolist(),
                 payload={
                     "chunk_id": chunk.chunk_id,
@@ -207,6 +230,61 @@ def get_all_chunks_for_docs(doc_ids: list[str], batch_size: int = 100) -> list[d
             break
         offset = next_offset
     return all_results
+
+
+def keyword_search(
+    keyword: str,
+    doc_ids: Optional[list[str]] = None,
+    top_k: int = 10,
+) -> list[dict]:
+    """Full-text keyword search over chunk `text` payload.
+
+    Complements :func:`semantic_search` for exact-token lookup of identifiers
+    (e.g. ``"INV-2024-0837"``, ``"C-MOH-2023-041"``) where dense embeddings
+    are unreliable. Requires the TEXT payload index created by
+    :func:`ensure_collection`.
+    """
+    kw = (keyword or "").strip()
+    if not kw:
+        return []
+
+    settings = get_settings()
+    client = get_qdrant_client()
+
+    must = [FieldCondition(key="text", match=MatchText(text=kw))]
+    if doc_ids:
+        must.append(
+            Filter(
+                should=[
+                    FieldCondition(key="doc_id", match=MatchValue(value=did))
+                    for did in doc_ids
+                ]
+            )
+        )
+
+    try:
+        records, _ = client.scroll(
+            collection_name=settings.qdrant_collection,
+            scroll_filter=Filter(must=must),
+            limit=top_k,
+            with_payload=True,
+        )
+    except Exception as exc:
+        logger.debug("keyword_search failed (text index missing?): %s", exc)
+        return []
+
+    return [
+        {
+            "score": 1.0,
+            "doc_id": rec.payload.get("doc_id"),
+            "text": rec.payload.get("text"),
+            "page_num": rec.payload.get("page_num"),
+            "language": rec.payload.get("language"),
+            "chunk_id": rec.payload.get("chunk_id"),
+            "source": "keyword",
+        }
+        for rec in records
+    ]
 
 
 def delete_doc_chunks(doc_id: str) -> None:

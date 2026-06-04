@@ -5,10 +5,35 @@ This is the core retrieval mechanism for the Cross-Checker agent.
 import json
 import re
 from langchain_core.tools import tool
-from app.services.vector_store import semantic_search
+from app.services.vector_store import semantic_search, keyword_search
 from app.services.graph_builder import query_graph_for_entities
 from app.utils.arabic_normalizer import extract_amounts
 from app.utils.llm_factory import get_llm
+
+# Identifier-like tokens (contract IDs, invoice numbers) that dense embeddings miss.
+# Examples matched: INV-2024-0837, C/MOH/2023/041, CON.21.A, 2024-INV-9
+_ID_TOKEN_RE = re.compile(r"\b[A-Z0-9][A-Z0-9\-_/.]{3,}\b")
+
+
+def _extract_id_like_tokens(query: str) -> list[str]:
+    """Extract identifier-shaped tokens from a query for keyword_search."""
+    if not query:
+        return []
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for m in _ID_TOKEN_RE.finditer(query):
+        tok = m.group(0)
+        # Require at least one digit OR a structural separator to avoid plain words.
+        if not (any(ch.isdigit() for ch in tok) or any(ch in "-_/." for ch in tok)):
+            continue
+        k = tok.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        tokens.append(tok)
+        if len(tokens) >= 5:
+            break
+    return tokens
 
 _JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
 
@@ -85,47 +110,33 @@ def _extract_json_dict(text: str) -> dict | None:
         return None
 
 
+# Relational signals that make graph traversal the better backend (rule-based, no LLM).
+# Kept deliberately narrow so the common factual check stays on the cheaper vector path
+# (and avoids triggering the entity-extraction LLM call inside the graph branch).
+_GRAPH_ROUTE_KEYWORDS = (
+    "reconcil", "contradict", "cross-document", "cross document",
+    "across documents", "between documents", "versus", " vs ",
+    "discrepanc", "mismatch", "linked", "traceab",
+)
+
+
 def _route_query(query: str) -> tuple[str, str, str]:
     """
-    Decide retrieval path:
+    Decide retrieval path with deterministic rules (no LLM call):
+      - graph: relational / cross-document checks (entity links, contradictions, reconciliation)
       - vector: factual / semantic lookup
-      - graph: relational / cross-document checks
     Returns: (route, reason, router_source)
     """
     q = (query or "").strip()
     if not q:
         return "vector", "Empty query defaults to semantic search.", "fallback"
 
-    # LLM-only router.
-    prompt = (
-        "Route this audit retrieval query to ONE backend.\n"
-        "Backends:\n"
-        "- vector: factual/semantic text lookup within documents\n"
-        "- graph: relational/cross-document traversal (entity links, contradictions, reconciliation)\n\n"
-        f"Query: {q}\n\n"
-        "Return JSON only:\n"
-        "{\n"
-        '  "route": "vector|graph",\n'
-        '  "reason": "short reason"\n'
-        "}\n"
-    )
-    try:
-        llm = get_llm(temperature=0.0)
-        resp = llm.invoke(prompt)
-        content = resp.content if hasattr(resp, "content") else str(resp)
-        if isinstance(content, list):
-            content = "".join(
-                c.get("text", "") if isinstance(c, dict) else str(c)
-                for c in content
-            )
-        data = _extract_json_dict(str(content))
-        route = str((data or {}).get("route", "vector")).strip().lower()
-        reason = str((data or {}).get("reason", "")).strip() or "LLM-routed query."
-        if route not in ("vector", "graph"):
-            route = "vector"
-        return route, reason, "llm"
-    except Exception:
-        return "vector", "Router fallback to semantic search.", "fallback"
+    ql = q.lower()
+    if any(k in ql for k in _GRAPH_ROUTE_KEYWORDS):
+        return "graph", "Relational/cross-document keywords detected; using graph traversal.", "rule"
+    if _extract_id_like_tokens(q):
+        return "graph", "Identifier tokens detected; using graph traversal for entity links.", "rule"
+    return "vector", "No relational signals; using semantic search.", "rule"
 
 
 @tool
@@ -152,7 +163,16 @@ def search_hybrid_rag(query: str, doc_ids: str, top_k: int = 10) -> str:
     # 2) Execute selected branch.
     vector_results = []
     graph_results = []
+    keyword_results: list[dict] = []
     effective_route = route
+
+    # Sparse channel — always run for ID-like tokens; cheap and high-precision
+    # for invoice/contract numbers that dense embeddings often miss.
+    id_tokens = _extract_id_like_tokens(query)
+    for tok in id_tokens:
+        keyword_results.extend(
+            keyword_search(keyword=tok, doc_ids=ids if ids else None, top_k=max(3, top_k // 2))
+        )
 
     if route == "vector":
         vector_results = semantic_search(query=query, doc_ids=ids if ids else None, top_k=top_k)
@@ -174,6 +194,21 @@ def search_hybrid_rag(query: str, doc_ids: str, top_k: int = 10) -> str:
     # 3) Merge and deduplicate
     seen_texts = set()
     merged = []
+
+    # Keyword (sparse) hits go first — exact identifier matches are highest
+    # precision and we want them at the top of the merged list.
+    for r in keyword_results:
+        key = (r.get("text") or "")[:100]
+        if key and key not in seen_texts:
+            seen_texts.add(key)
+            merged.append({
+                "source": "keyword",
+                "doc_id": r.get("doc_id", ""),
+                "page": r.get("page_num", 0),
+                "language": r.get("language", ""),
+                "score": 1.0,
+                "text": r.get("text") or "",
+            })
 
     for r in vector_results:
         key = r.get("text", "")[:100]
@@ -209,5 +244,7 @@ def search_hybrid_rag(query: str, doc_ids: str, top_k: int = 10) -> str:
         "results": merged,
         "vector_count": len(vector_results),
         "graph_count": len(graph_results),
+        "keyword_count": len(keyword_results),
+        "id_tokens": id_tokens,
         "total": len(merged),
     })

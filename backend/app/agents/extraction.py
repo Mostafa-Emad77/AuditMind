@@ -1,22 +1,98 @@
 """Extraction Agent — first node in the LangGraph audit pipeline."""
-import json
+import asyncio
+import hashlib
 import logging
-from datetime import datetime
 
 from langgraph.config import get_stream_writer
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import AIMessage
 
 from app.models.state import AuditState
-from app.models.schemas import ReasoningStep
+from app.models.schemas import ReasoningStep, DocumentChunk, DocumentMeta
 from app.services.entity_extractor import extract_entities_from_chunks
+from app.services.vector_store import semantic_search
 from app.services.graph_builder import (
     init_graph_schema,
     store_document_node,
     store_entities,
     store_relationships,
 )
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# Per-doc-type targeted retrieval queries that complement the broad base query.
+_DOC_TYPE_QUERIES: dict[str, list[str]] = {
+    "invoice": [
+        "amount date party name contract invoice",
+        "invoice total subtotal VAT tax line items",
+        "invoice number due date vendor client",
+    ],
+    "contract": [
+        "amount date party name contract invoice",
+        "contract value payment schedule milestones",
+        "parties signatures clauses obligations",
+    ],
+    "bank_statement": [
+        "amount date party name contract invoice",
+        "bank transaction debit credit balance",
+        "payment transfer beneficiary reference",
+    ],
+    "balance_sheet": [
+        "amount date party name contract invoice",
+        "assets liabilities equity total",
+        "balance sheet entries accounts",
+    ],
+    "audit_report": [
+        "amount date party name contract invoice",
+        "audit findings figures cited documents",
+        "audit clauses recommendations",
+    ],
+}
+_BASE_QUERIES = [
+    "amount date party name contract invoice",
+    "payment schedule milestone value total",
+]
+
+
+def _adaptive_top_k(doc: DocumentMeta, base_k: int, max_k: int) -> int:
+    """Scale top_k with page count, bounded by max_k."""
+    pages = getattr(doc, "page_count", 1) or 1
+    if pages <= 5:
+        return base_k
+    if pages <= 15:
+        return min(base_k + 15, max_k)
+    return max_k
+
+
+def _chunk_key(r: dict) -> str:
+    """Stable dedup key: (doc_id, page_num, text[:120] hash)."""
+    text_fragment = (r.get("text") or "")[:120]
+    raw = f"{r.get('doc_id','')}-{r.get('page_num', 0)}-{text_fragment}"
+    return hashlib.md5(raw.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _retrieve_chunks_for_doc(doc: DocumentMeta, base_k: int, max_k: int) -> list[dict]:
+    """
+    Multi-query adaptive retrieval for a single document.
+    Runs 2-3 targeted queries (depending on doc type), deduplicates by
+    (doc_id, page_num, text prefix hash), and caps at max_k unique chunks.
+    """
+    queries = _DOC_TYPE_QUERIES.get(doc.doc_type, _BASE_QUERIES)
+    per_query_k = _adaptive_top_k(doc, base_k, max_k)
+
+    seen: dict[str, dict] = {}
+    for query in queries:
+        if len(seen) >= max_k:
+            break
+        results = semantic_search(query=query, doc_ids=[doc.doc_id], top_k=per_query_k)
+        for r in results:
+            if len(seen) >= max_k:
+                break
+            key = _chunk_key(r)
+            if key not in seen:
+                seen[key] = r
+
+    return list(seen.values())
 
 
 def _emit(writer, agent: str, step_type: str, content: str, **kwargs) -> ReasoningStep:
@@ -79,23 +155,32 @@ async def extraction_agent(state: AuditState) -> dict:
     all_entities = []
     all_relationships = []
 
-    for doc in documents:
+    settings = get_settings()
+    loop = asyncio.get_running_loop()
+
+    async def _process_doc(doc: DocumentMeta) -> tuple[list, list]:
+        """Retrieve chunks, extract entities/relationships, and persist to Neo4j for one document.
+
+        Qdrant retrieval and Neo4j writes are synchronous network I/O, so they run in the
+        default executor to keep the event loop free. Documents are independent, so callers
+        gather these coroutines to process them concurrently.
+        """
         step = _emit(writer, "extraction", "tool_call",
                      f"Extracting entities from: {doc.filename}",
                      tool_name="extract_entities",
                      tool_input={"doc_id": doc.doc_id, "doc_type": doc.doc_type})
         new_steps.append(step)
 
-        # Retrieve chunks from Qdrant
-        from app.services.vector_store import semantic_search
-        chunks_raw = semantic_search(
-            query="amount date party name contract invoice",
-            doc_ids=[doc.doc_id],
-            top_k=50,
+        # Adaptive multi-query retrieval from Qdrant (sync I/O → offload)
+        chunks_raw = await loop.run_in_executor(
+            None,
+            _retrieve_chunks_for_doc,
+            doc,
+            settings.extraction_top_k_base,
+            settings.extraction_top_k_max,
         )
 
         # Reconstruct minimal DocumentChunk objects for entity extraction
-        from app.models.schemas import DocumentChunk
         chunks = [
             DocumentChunk(
                 doc_id=doc.doc_id,
@@ -108,11 +193,22 @@ async def extraction_agent(state: AuditState) -> dict:
             for i, r in enumerate(chunks_raw)
         ]
 
+        logger.info(
+            "Extraction retrieval — %s: %d unique chunks (base_k=%d, max_k=%d, pages=%d)",
+            doc.filename,
+            len(chunks),
+            settings.extraction_top_k_base,
+            settings.extraction_top_k_max,
+            doc.page_count or 1,
+        )
+
         step = _emit(
             writer,
             "extraction",
             "thought",
-            f"Retrieved {len(chunks)} candidate chunks for {doc.filename}. Starting chunk-by-chunk extraction...",
+            f"Retrieved {len(chunks)} unique candidate chunks for {doc.filename} "
+            f"(adaptive multi-query, max_k={settings.extraction_top_k_max}). "
+            "Starting entity extraction...",
         )
         new_steps.append(step)
 
@@ -141,8 +237,6 @@ async def extraction_agent(state: AuditState) -> dict:
                 doc_type=doc.doc_type,
                 progress_callback=_on_progress,
             )
-            all_entities.extend(entities)
-            all_relationships.extend(relationships)
 
             step = _emit(writer, "extraction", "tool_result",
                          f"Found {len(entities)} entities and {len(relationships)} relationships in {doc.filename}",
@@ -150,16 +244,25 @@ async def extraction_agent(state: AuditState) -> dict:
                          tool_output=f"{len(entities)} entities, {len(relationships)} relationships")
             new_steps.append(step)
 
-            # Store in Neo4j
-            store_document_node(doc)
-            store_entities(entities)
-            store_relationships(relationships)
+            # Store in Neo4j (sync driver → offload so it doesn't block the event loop)
+            await loop.run_in_executor(None, store_document_node, doc)
+            await loop.run_in_executor(None, store_entities, entities)
+            await loop.run_in_executor(None, store_relationships, relationships)
+
+            return entities, relationships
 
         except Exception as e:
             logger.error("Entity extraction failed for %s: %s", doc.filename, e)
             step = _emit(writer, "extraction", "thought",
                          f"Entity extraction encountered an issue for {doc.filename}: {e}")
             new_steps.append(step)
+            return [], []
+
+    # Documents are independent → process them concurrently.
+    results = await asyncio.gather(*[_process_doc(doc) for doc in documents])
+    for entities, relationships in results:
+        all_entities.extend(entities)
+        all_relationships.extend(relationships)
 
     # Summary
     summary = (

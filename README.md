@@ -146,8 +146,10 @@ Settings come from `backend/.env` and map to `app/config.py`. Important variable
 | Variable | Purpose |
 |----------|---------|
 | `OPENROUTER_API_KEY` | Required for LLM calls |
-| `OPENROUTER_MODEL` | Model slug (default in code: `google/gemini-3-flash-preview`) |
-| `OPENROUTER_REASONING` | `true` / `false` — reasoning payload for supported models |
+| `OPENROUTER_MODEL` | Default model for planner, report writer, hybrid RAG router, document classification (default in code: `openai/gpt-oss-20b:nitro`) |
+| `OPENROUTER_MODEL_NER_ARABIC` | Entity extraction / NER per chunk (default: `qwen/qwen3.5-122b-a10b`; not substituted by `OPENROUTER_MODEL`) |
+| `OPENROUTER_MODEL_RELATION` | Cross-checker contradiction and checklist intent logic (default: `anthropic/claude-sonnet-4.6`; not substituted by `OPENROUTER_MODEL`) |
+| `OPENROUTER_REASONING` | `true` / `false` — reasoning payload for the default model only (`OPENROUTER_MODEL`); stage models omit it |
 | `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `NEO4J_DATABASE` | Graph database |
 | `QDRANT_URL`, `QDRANT_API_KEY` (if applicable) | Vector store |
 | `REDIS_URL` | Session / report storage |

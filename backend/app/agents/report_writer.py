@@ -173,6 +173,15 @@ async def report_writer_agent(state: AuditState) -> dict:
 
         report_data = json.loads(content)
 
+        # overall_risk is always deterministic from accepted findings.
+        # The LLM suggestion is discarded to prevent hallucinated risk labels.
+        llm_risk_suggestion = report_data.get("overall_risk", "")
+        if llm_risk_suggestion and llm_risk_suggestion != overall_risk:
+            logger.info(
+                "LLM suggested overall_risk=%r but deterministic value=%r — using deterministic.",
+                llm_risk_suggestion,
+                overall_risk,
+            )
         report = AuditReport(
             audit_id=audit_id,
             title=report_data.get("title", f"Audit Report — {', '.join(doc_names[:2])}"),
@@ -181,7 +190,7 @@ async def report_writer_agent(state: AuditState) -> dict:
             documents_reviewed=doc_names,
             findings=findings,
             recommendations=report_data.get("recommendations", []),
-            overall_risk=report_data.get("overall_risk", overall_risk),
+            overall_risk=overall_risk,
         )
         snap, ent_conflicts = build_reconciliation_payload(documents, findings)
         report = report.model_copy(

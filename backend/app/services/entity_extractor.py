@@ -9,6 +9,9 @@ from langchain_core.output_parsers import JsonOutputParser
 
 from app.models.schemas import Entity, Relationship, DocumentChunk
 from app.utils.llm_factory import get_llm
+from app.utils.canonical_id import canonical_entity_id, canonical_rel_id
+from app.utils.money_parse import parse_monetary_amount, extract_currency_code
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +78,7 @@ async def extract_entities_from_chunk(
     max_retries: int = 2,
 ) -> tuple[list[Entity], list[Relationship]]:
     """Extract entities and relationships from a single document chunk (async)."""
-    llm = get_llm(temperature=0.0)
+    llm = get_llm(temperature=0.0, role="ner_arabic")
     parser = JsonOutputParser()
     chain = _EXTRACTION_PROMPT | llm | parser
 
@@ -95,10 +98,29 @@ async def extract_entities_from_chunk(
                     raw_lang = str(e.get("source_language") or "unknown").strip().lower()
                     if raw_lang not in _lang_ok:
                         raw_lang = "unknown"
+                    norm_val = e.get("normalized_value", e.get("value", ""))
+                    raw_val = e.get("value", "")
+                    # Deterministic amount parsing — independent of LLM string formatting.
+                    parsed_amount: float | None = None
+                    parsed_currency: str | None = None
+                    if etype == "amount":
+                        # Prefer normalized_value (the LLM is instructed to put canonical Western form there).
+                        for candidate in (norm_val, raw_val, e.get("western_numeral_form")):
+                            if candidate and parsed_amount is None:
+                                parsed_amount = parse_monetary_amount(candidate)
+                            if candidate and parsed_currency is None:
+                                parsed_currency = extract_currency_code(candidate)
+                            if parsed_amount is not None and parsed_currency is not None:
+                                break
                     kwargs: dict = dict(
+                        entity_id=canonical_entity_id(
+                            etype, norm_val, chunk.doc_id,
+                            amount_value=parsed_amount,
+                            amount_currency=parsed_currency,
+                        ),
                         entity_type=etype,
-                        value=e.get("value", ""),
-                        normalized_value=e.get("normalized_value", e.get("value", "")),
+                        value=raw_val,
+                        normalized_value=norm_val,
                         source_doc_id=chunk.doc_id,
                         source_page=chunk.page_num,
                         confidence=0.9,
@@ -133,30 +155,55 @@ async def extract_entities_from_chunk(
                             "retainer", "vat_tax", "unknown",
                         }
                         kwargs["amount_role"] = raw_role if raw_role in _valid_roles else "unknown"
+                        kwargs["amount_value"] = parsed_amount
+                        kwargs["amount_currency"] = parsed_currency
                     else:
                         kwargs["western_numeral_form"] = None
                         kwargs["arabic_indic_numeral_form"] = None
                         kwargs["numeral_mismatch"] = None
+                        kwargs["amount_value"] = None
+                        kwargs["amount_currency"] = None
                     entities.append(Entity(**kwargs))
                 except Exception:
                     continue
 
-            relationships = []
-            entity_map = {e.value: e for e in entities}
-            entity_map.update({e.normalized_value: e for e in entities})
+            # Dedupe entities within this chunk by canonical entity_id (LLM may emit duplicates).
+            entities = list({ent.entity_id: ent for ent in entities}.values())
 
+            relationships = []
+            entity_map: dict[str, Entity] = {}
+            for ent in entities:
+                # Use lowercased keys so LLM casing/whitespace drift still resolves.
+                entity_map[ent.value.strip().lower()] = ent
+                entity_map[ent.normalized_value.strip().lower()] = ent
+
+            dropped = 0
             for r in result.get("relationships", []):
-                src = entity_map.get(r.get("source_value", ""))
-                tgt = entity_map.get(r.get("target_value", ""))
-                if src and tgt:
+                src_key = (r.get("source_value") or "").strip().lower()
+                tgt_key = (r.get("target_value") or "").strip().lower()
+                src = entity_map.get(src_key)
+                tgt = entity_map.get(tgt_key)
+                if src and tgt and src.entity_id != tgt.entity_id:
+                    rel_type = r.get("relationship_type", "other")
                     relationships.append(Relationship(
+                        rel_id=canonical_rel_id(src.entity_id, tgt.entity_id, rel_type),
                         source_entity_id=src.entity_id,
                         target_entity_id=tgt.entity_id,
-                        relationship_type=r.get("relationship_type", "other"),
+                        relationship_type=rel_type,
                         source_doc_id=chunk.doc_id,
                         source_page=chunk.page_num,
                         confidence=0.85,
                     ))
+                else:
+                    dropped += 1
+            if dropped:
+                logger.debug(
+                    "Dropped %d relationship(s) in chunk %s (unresolved endpoints)",
+                    dropped, chunk.chunk_id,
+                )
+
+            # Dedupe relationships within this chunk by canonical rel_id.
+            relationships = list({rel.rel_id: rel for rel in relationships}.values())
 
             return entities, relationships
 
@@ -181,57 +228,93 @@ async def extract_entities_from_chunks(
     ] = None,
 ) -> tuple[list[Entity], list[Relationship]]:
     """
-    Extract entities from multiple chunks sequentially with rate-limit pacing.
+    Extract entities from multiple chunks concurrently with a semaphore.
 
-    max_chunks defaults to None, in which case it is calculated dynamically:
-      - 5 chunks per page of the source document, capped at 15.
-    This means a 2-page CV gets ~10 chunks, a 24-page report gets 15.
+    max_chunks resolution order:
+      1. Explicit `max_chunks` argument (back-compat).
+      2. Otherwise: `settings.extraction_chunk_cap` (None = no internal cap).
+         The single upstream gate is `extraction_top_k_max` applied during
+         retrieval — this avoids the prior double-cap bug where well-retrieved
+         chunks were silently truncated to 15 here.
 
-    Requests are sent one-at-a-time with a 4-second gap so we stay well under
-    the OpenRouter free-tier limit of 20 req/min (= 1 req per 3 seconds).
+    Concurrency and inter-batch sleep are controlled by config:
+      - extraction_concurrency: max parallel LLM calls (default 3 for paid tier)
+      - extraction_chunk_sleep: seconds between batches (default 0 for paid tier;
+        set to 4.0 in .env to restore free-tier safe pacing)
     """
+    settings = get_settings()
+    concurrency = max(1, settings.extraction_concurrency)
+    chunk_sleep = max(0.0, settings.extraction_chunk_sleep)
+
     all_entities: list[Entity] = []
     all_relationships: list[Relationship] = []
 
+    # Shared mutable progress counters (safe: asyncio is single-threaded)
+    completed_count = 0
+
     meaningful = [c for c in chunks if len(c.normalized_text) >= 100]
 
-    # Dynamic limit: 5 chunks per page, min 5, max 15
     if max_chunks is None:
-        page_count = max((c.page_num for c in chunks), default=1)
-        max_chunks = min(max(page_count * 5, 5), 15)
+        max_chunks = settings.extraction_chunk_cap  # may stay None → no cap
 
-    to_process = meaningful[:max_chunks]
+    to_process = meaningful if max_chunks is None else meaningful[:max_chunks]
     total = len(to_process)
-    logger.info("Entity extraction: processing %d/%d meaningful chunks", total, len(meaningful))
+    logger.info(
+        "Entity extraction: processing %d/%d meaningful chunks (concurrency=%d, sleep=%.1fs)",
+        total, len(meaningful), concurrency, chunk_sleep,
+    )
 
-    # Sequential with 4-second pacing — 15 req/min, safely under 20 req/min limit
-    for i, chunk in enumerate(to_process):
-        if i > 0:
-            await asyncio.sleep(4)
+    semaphore = asyncio.Semaphore(concurrency)
 
-        try:
-            entities, relationships = await extract_entities_from_chunk(chunk, doc_type)
+    async def _process_chunk(
+        idx: int, chunk: DocumentChunk
+    ) -> tuple[int, list[Entity], list[Relationship]]:
+        """Run extraction for one chunk under the semaphore."""
+        async with semaphore:
+            try:
+                entities, relationships = await extract_entities_from_chunk(chunk, doc_type)
+            except Exception as e:
+                logger.warning("Extraction error for chunk %s: %s", chunk.chunk_id, e)
+                entities, relationships = [], []
+            return idx, entities, relationships
+
+    # Process in batches so progress_callback and sleep work naturally across groups
+    batch_size = concurrency
+    for batch_start in range(0, total, batch_size):
+        batch = list(enumerate(to_process[batch_start: batch_start + batch_size], start=batch_start))
+
+        results = await asyncio.gather(*[_process_chunk(idx, chunk) for idx, chunk in batch])
+
+        # Results arrive in completion order; sort by original index for deterministic callback order
+        for idx, entities, relationships in sorted(results, key=lambda r: r[0]):
             all_entities.extend(entities)
             all_relationships.extend(relationships)
-        except Exception as e:
-            logger.warning("Extraction error for chunk %s: %s", chunk.chunk_id, e)
+            completed_count += 1
+            chunk = to_process[idx]
 
-        if progress_callback is not None:
-            try:
-                maybe_awaitable = progress_callback(
-                    i + 1,
-                    total,
-                    len(all_entities),
-                    len(all_relationships),
-                    chunk,
-                )
-                if asyncio.iscoroutine(maybe_awaitable):
-                    await maybe_awaitable
-            except Exception as e:
-                logger.debug("Progress callback failed: %s", e)
+            if progress_callback is not None:
+                try:
+                    maybe_awaitable = progress_callback(
+                        completed_count,
+                        total,
+                        len(all_entities),
+                        len(all_relationships),
+                        chunk,
+                    )
+                    if asyncio.iscoroutine(maybe_awaitable):
+                        await maybe_awaitable
+                except Exception as e:
+                    logger.debug("Progress callback failed: %s", e)
 
-        if (i + 1) % 5 == 0 or (i + 1) == total:
-            logger.info("Extracted entities from %d/%d chunks", i + 1, total)
+        logger.info(
+            "Extracted entities from %d/%d chunks",
+            min(batch_start + batch_size, total),
+            total,
+        )
+
+        # Inter-batch sleep (only relevant for free-tier pacing)
+        if chunk_sleep > 0 and (batch_start + batch_size) < total:
+            await asyncio.sleep(chunk_sleep)
 
     logger.info(
         "Total extracted: %d entities, %d relationships from %d chunks",

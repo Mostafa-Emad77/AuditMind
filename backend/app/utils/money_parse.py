@@ -112,3 +112,40 @@ def amounts_within_tiny_tolerance(a: float, b: float) -> bool:
         return True
     scale = max(abs(a), abs(b), 1.0)
     return diff <= max(1e-6 * scale, 0.01)
+
+
+# ─── Currency extraction ────────────────────────────────────────────────────
+
+# Map raw tokens (Latin abbreviations + Arabic terms) to canonical ISO-like codes.
+_CURRENCY_CANON: dict[str, str] = {
+    "usd": "USD", "us$": "USD", "$": "USD",
+    "eur": "EUR", "€": "EUR",
+    "gbp": "GBP", "£": "GBP",
+    "egp": "EGP", "le": "EGP", "l.e": "EGP", "l.e.": "EGP",
+    "sar": "SAR", "aed": "AED", "kwd": "KWD",
+    "omr": "OMR", "qar": "QAR", "bhd": "BHD",
+    # Arabic
+    "دولار": "USD", "يورو": "EUR", "جنيه": "EGP",
+    "ج.م": "EGP", "ج.م.": "EGP",
+    "ريال": "SAR", "درهم": "AED",
+}
+
+_CURRENCY_TOKEN_RE = re.compile(
+    rf"({_CURRENCY})", re.IGNORECASE | re.UNICODE,
+)
+
+
+def extract_currency_code(value: str) -> Optional[str]:
+    """Extract a single canonical currency code from text. Returns None if absent or ambiguous."""
+    if not value or not str(value).strip():
+        return None
+    s = str(value).translate(_ARABIC_INDIC)
+    found: list[str] = []
+    for m in _CURRENCY_TOKEN_RE.finditer(s):
+        tok = m.group(1).strip().lower()
+        canon = _CURRENCY_CANON.get(tok)
+        if canon and canon not in found:
+            found.append(canon)
+    if len(found) == 1:
+        return found[0]
+    return None

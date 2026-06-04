@@ -1,9 +1,8 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { ArrowDownUp, Scale } from "lucide-react";
+import { cn } from "@/lib/utils";
 import type { AuditReport, EntityConflictRow } from "@/types";
-import { cn, severityBg } from "@/lib/utils";
 
 function formatMoney(n: number | null | undefined, currency: string): string {
   if (n === null || n === undefined || Number.isNaN(n)) return "—";
@@ -15,6 +14,12 @@ type SortKey = "entity" | "severity" | "doc_a" | "doc_b";
 function shortDocLabel(id: string, docFilenameById: Record<string, string>): string {
   return docFilenameById[id] || `${id.slice(0, 8)}…`;
 }
+
+const CONFLICT_BADGE: Record<string, string> = {
+  critical: "bg-red-50 text-red-700 border-red-200",
+  warning: "bg-amber-50 text-amber-700 border-amber-200",
+  ok: "bg-emerald-50 text-emerald-700 border-emerald-200",
+};
 
 export function ReconciliationPanel({
   report,
@@ -63,177 +68,170 @@ export function ReconciliationPanel({
   };
 
   const variance = snap?.variance_vs_contract;
-  const varianceTone =
-    variance === null || variance === undefined
-      ? "text-muted-foreground"
-      : Math.abs(variance) < 1
-        ? "text-emerald-400"
-        : variance > 0
-          ? "text-red-400"
-          : "text-amber-400";
+  const varianceIsFlag = variance !== null && variance !== undefined && !Number.isNaN(variance) && Math.abs(variance) > 1;
 
   if (!isComplete && isRunning && !report) {
     return (
-      <div className="flex flex-col items-center justify-center py-20 text-center text-sm text-muted-foreground">
-        <Scale className="h-10 w-10 mb-3 opacity-30" />
+      <div className="flex flex-col items-center justify-center py-20 text-center text-sm text-muted-foreground bg-white border border-outline-variant rounded-lg">
+        <span className="material-symbols-outlined text-[40px] text-muted-foreground/40 mb-3">balance</span>
         Reconciliation data will be available when the audit completes.
       </div>
     );
   }
 
   return (
-    <div className="space-y-8 max-w-4xl">
-      <div>
-        <h2 className="text-sm font-semibold mb-1 flex items-center gap-2">
-          <Scale className="h-4 w-4 text-primary" />
-          Number reconciliation
-        </h2>
-        <p className="text-xs text-muted-foreground mb-4">
-          Cross-document totals derived from extracted entities and graph-linked amounts.
-        </p>
+    <div className="space-y-6 max-w-4xl">
 
-        {!snap ? (
-          <div className="rounded-xl border border-dashed border-border bg-secondary/20 px-4 py-8 text-center text-sm text-muted-foreground">
-            {isComplete
-              ? "Insufficient structured data to build a reconciliation snapshot for this audit."
-              : "No snapshot yet."}
-          </div>
-        ) : (
-          <div className="rounded-xl border border-border bg-card/40 overflow-hidden">
-            <div className="grid grid-cols-2 md:grid-cols-4 divide-x divide-border/60 border-b border-border/60">
-              <div className="p-4">
-                <p className="text-[10px] uppercase tracking-wide text-muted-foreground font-medium">
-                  Contract total
-                </p>
-                <p className="text-lg font-semibold mt-1 tabular-nums">
-                  {formatMoney(snap.contract_total, snap.currency)}
-                </p>
+      {/* Metrics grid */}
+      {snap ? (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          {[
+            { label: "Contract Total", value: formatMoney(snap.contract_total, snap.currency), icon: "receipt_long", variant: "default" },
+            { label: "Invoice Total", value: formatMoney(snap.invoice_total, snap.currency), icon: "description", variant: "default" },
+            { label: "Bank Paid Total", value: formatMoney(snap.bank_paid_total, snap.currency), icon: "account_balance", variant: "default" },
+            {
+              label: "Variance Flagged",
+              value: variance === null || variance === undefined
+                ? "—"
+                : `${variance >= 0 ? "+" : ""}${variance.toLocaleString()} ${snap.currency}`,
+              icon: "warning",
+              variant: varianceIsFlag ? "error" : "ok",
+            },
+          ].map(({ label, value, icon, variant }) => (
+            <div
+              key={label}
+              className={cn(
+                "rounded-xl border p-4",
+                variant === "error" && "bg-red-50 border-red-200",
+                variant === "ok" && "bg-emerald-50 border-emerald-200",
+                variant === "default" && "bg-white border-outline-variant"
+              )}
+            >
+              <div className="flex items-center gap-2 mb-2">
+                <span className={cn(
+                  "material-symbols-outlined text-[18px]",
+                  variant === "error" && "text-red-600",
+                  variant === "ok" && "text-emerald-600",
+                  variant === "default" && "text-muted-foreground"
+                )}>{icon}</span>
+                <p className={cn(
+                  "text-[11px] font-semibold uppercase tracking-wide",
+                  variant === "error" && "text-red-700",
+                  variant === "ok" && "text-emerald-700",
+                  variant === "default" && "text-muted-foreground"
+                )}>{label}</p>
               </div>
-              <div className="p-4">
-                <p className="text-[10px] uppercase tracking-wide text-muted-foreground font-medium">
-                  Invoice total
-                </p>
-                <p className="text-lg font-semibold mt-1 tabular-nums">
-                  {formatMoney(snap.invoice_total, snap.currency)}
-                </p>
-              </div>
-              <div className="p-4">
-                <p className="text-[10px] uppercase tracking-wide text-muted-foreground font-medium">
-                  Bank paid (sum)
-                </p>
-                <p className="text-lg font-semibold mt-1 tabular-nums">
-                  {formatMoney(snap.bank_paid_total, snap.currency)}
-                </p>
-              </div>
-              <div className="p-4 bg-primary/5">
-                <p className="text-[10px] uppercase tracking-wide text-muted-foreground font-medium">
-                  vs contract (gap)
-                </p>
-                <p className={cn("text-lg font-semibold mt-1 tabular-nums", varianceTone)}>
-                  {variance === null || variance === undefined ? "—" : `${variance >= 0 ? "+" : ""}${variance.toLocaleString()} ${snap.currency}`}
-                </p>
-              </div>
+              <p className={cn(
+                "text-xl font-bold tabular-nums",
+                variant === "error" && "text-red-700",
+                variant === "ok" && "text-emerald-700",
+                variant === "default" && "text-foreground"
+              )}>{value}</p>
             </div>
-            {snap.notes && (
-              <p className="text-xs text-muted-foreground px-4 py-2 border-t border-border/40 bg-secondary/20">
-                {snap.notes}
-              </p>
-            )}
-          </div>
-        )}
-      </div>
+          ))}
+        </div>
+      ) : (
+        <div className="rounded-xl border border-dashed border-outline-variant bg-secondary px-4 py-8 text-center text-sm text-muted-foreground">
+          {isComplete
+            ? "Insufficient structured data to build a reconciliation snapshot for this audit."
+            : "No snapshot yet."}
+        </div>
+      )}
 
+      {snap?.notes && (
+        <p className="text-xs text-muted-foreground px-1">{snap.notes}</p>
+      )}
+
+      {/* Entity conflicts table */}
       <div>
-        <h2 className="text-sm font-semibold mb-1 flex items-center gap-2">
-          <ArrowDownUp className="h-4 w-4 text-primary" />
-          Entity conflicts
-        </h2>
-        <p className="text-xs text-muted-foreground mb-3">
-          Only cross-document conflicts detected in the knowledge graph (not all extracted entities).
-        </p>
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <h2 className="text-sm font-bold text-foreground flex items-center gap-2">
+              <span className="material-symbols-outlined text-[18px] text-primary">compare_arrows</span>
+              Entity Conflicts
+            </h2>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              Cross-document conflicts detected in the knowledge graph.
+            </p>
+          </div>
+          <div className="flex gap-2">
+            <button className="flex items-center gap-1.5 px-3 py-1.5 border border-outline-variant rounded text-xs font-semibold text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors">
+              <span className="material-symbols-outlined text-[14px]">upload</span>
+              Export
+            </button>
+            <button className="flex items-center gap-1.5 px-3 py-1.5 border border-outline-variant rounded text-xs font-semibold text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors">
+              <span className="material-symbols-outlined text-[14px]">picture_as_pdf</span>
+              Download PDF
+            </button>
+          </div>
+        </div>
 
         {sortedRows.length === 0 ? (
-          <div className="rounded-lg border border-border bg-secondary/10 px-4 py-6 text-center text-sm text-muted-foreground">
+          <div className="rounded-lg border border-outline-variant bg-white px-4 py-10 text-center text-sm text-muted-foreground">
             No graph-linked amount conflicts for this session.
           </div>
         ) : (
-          <div className="rounded-lg border border-border overflow-x-auto">
-            <table className="w-full text-sm">
+          <div className="bg-white rounded-lg border border-outline-variant overflow-hidden">
+            <table className="w-full text-left border-collapse">
               <thead>
-                <tr className="border-b border-border bg-secondary/30 text-left text-xs text-muted-foreground">
-                  <th className="p-2 font-medium">
-                    <button
-                      type="button"
-                      className="inline-flex items-center gap-1 hover:text-foreground"
-                      onClick={() => toggleSort("entity")}
-                    >
-                      Entity / anchor
-                    </button>
-                  </th>
-                  <th className="p-2 font-medium">
-                    <button
-                      type="button"
-                      className="inline-flex items-center gap-1 hover:text-foreground"
-                      onClick={() => toggleSort("doc_a")}
-                    >
-                      Document A
-                    </button>
-                  </th>
-                  <th className="p-2 font-medium">
-                    <button
-                      type="button"
-                      className="inline-flex items-center gap-1 hover:text-foreground"
-                      onClick={() => toggleSort("doc_b")}
-                    >
-                      Document B
-                    </button>
-                  </th>
-                  <th className="p-2 font-medium w-28">
-                    <button
-                      type="button"
-                      className="inline-flex items-center gap-1 hover:text-foreground"
-                      onClick={() => toggleSort("severity")}
-                    >
-                      Severity
-                    </button>
-                  </th>
+                <tr className="bg-secondary border-b border-outline-variant">
+                  {[
+                    { key: "entity" as SortKey, label: "Entity ID" },
+                    { key: "doc_a" as SortKey, label: "Doc A (Contract)" },
+                    { key: "doc_b" as SortKey, label: "Doc B (Invoice)" },
+                    { key: "severity" as SortKey, label: "Conflict Type" },
+                  ].map(({ key, label }) => (
+                    <th key={key} className="py-3 px-4 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                      <button
+                        type="button"
+                        className="inline-flex items-center gap-1 hover:text-foreground transition-colors"
+                        onClick={() => toggleSort(key)}
+                      >
+                        {label}
+                        {sortKey === key && (
+                          <span className="material-symbols-outlined text-[12px]">
+                            {sortDir === "asc" ? "arrow_upward" : "arrow_downward"}
+                          </span>
+                        )}
+                      </button>
+                    </th>
+                  ))}
                 </tr>
               </thead>
               <tbody>
-                {sortedRows.map((r: EntityConflictRow, i: number) => (
-                  <tr key={i} className="border-b border-border/50 hover:bg-accent/20">
-                    <td className="p-2 align-top max-w-[200px]">
-                      <span className="font-medium text-foreground/90 line-clamp-2">{r.entity_label}</span>
-                      {r.anchor_hint && (
-                        <span className="block text-[10px] text-muted-foreground mt-0.5 truncate">
-                          {r.anchor_hint}
-                        </span>
-                      )}
-                    </td>
-                    <td className="p-2 align-top text-xs max-w-[200px]">
-                      <span className="text-[10px] text-muted-foreground block mb-0.5 truncate">
-                        {shortDocLabel(r.doc_a_id, docFilenameById)}
-                      </span>
-                      <span className="font-mono break-all">{r.doc_a_value}</span>
-                    </td>
-                    <td className="p-2 align-top text-xs max-w-[200px]">
-                      <span className="text-[10px] text-muted-foreground block mb-0.5 truncate">
-                        {shortDocLabel(r.doc_b_id, docFilenameById)}
-                      </span>
-                      <span className="font-mono break-all">{r.doc_b_value}</span>
-                    </td>
-                    <td className="p-2 align-top">
-                      <span
-                        className={cn(
-                          "text-[10px] font-semibold px-2 py-0.5 rounded-full border",
-                          severityBg(r.severity)
+                {sortedRows.map((r: EntityConflictRow, i: number) => {
+                  const docAName = shortDocLabel(r.doc_a_id, docFilenameById);
+                  const docBName = shortDocLabel(r.doc_b_id, docFilenameById);
+                  return (
+                    <tr key={i} className="border-b border-outline-variant last:border-0 hover:bg-secondary transition-colors">
+                      <td className="py-3 px-4 align-top">
+                        <p className="text-[13px] font-medium text-foreground max-w-[180px] truncate">{r.entity_label}</p>
+                        {r.anchor_hint && (
+                          <p className="text-[11px] text-muted-foreground mt-0.5 truncate">{r.anchor_hint}</p>
                         )}
-                      >
-                        {r.severity}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
+                      </td>
+                      <td className="py-3 px-4 align-top">
+                        <p className="text-[11px] text-muted-foreground mb-0.5 truncate max-w-[150px]">{docAName}</p>
+                        <p className="text-[13px] font-mono text-foreground">{r.doc_a_value}</p>
+                      </td>
+                      <td className="py-3 px-4 align-top">
+                        <p className="text-[11px] text-muted-foreground mb-0.5 truncate max-w-[150px]">{docBName}</p>
+                        <p className="text-[13px] font-mono text-foreground">{r.doc_b_value}</p>
+                      </td>
+                      <td className="py-3 px-4 align-top">
+                        <span className={cn(
+                          "inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[11px] font-semibold",
+                          CONFLICT_BADGE[r.severity] ?? "bg-secondary text-foreground border-outline-variant"
+                        )}>
+                          <span className="material-symbols-outlined text-[11px]">
+                            {r.severity === "critical" ? "error" : r.severity === "warning" ? "warning" : "check_circle"}
+                          </span>
+                          {r.severity.charAt(0).toUpperCase() + r.severity.slice(1)}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -242,3 +240,4 @@ export function ReconciliationPanel({
     </div>
   );
 }
+

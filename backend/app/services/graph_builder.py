@@ -113,6 +113,8 @@ def store_entities(entities: list[Entity]) -> None:
             "western_numeral_form": getattr(e, "western_numeral_form", None),
             "arabic_indic_numeral_form": getattr(e, "arabic_indic_numeral_form", None),
             "numeral_mismatch": getattr(e, "numeral_mismatch", None),
+            "amount_value": getattr(e, "amount_value", None),
+            "amount_currency": getattr(e, "amount_currency", None),
         }
         for e in entities
     ]
@@ -123,7 +125,8 @@ def store_entities(entities: list[Entity]) -> None:
                 """
                 UNWIND $records AS rec
                 MERGE (e:Entity {entity_id: rec.entity_id})
-                SET e.entity_type = rec.entity_type,
+                ON CREATE SET
+                    e.entity_type = rec.entity_type,
                     e.value = rec.value,
                     e.normalized_value = rec.normalized_value,
                     e.source_doc_id = rec.source_doc_id,
@@ -134,14 +137,40 @@ def store_entities(entities: list[Entity]) -> None:
                     e.coreference_note = rec.coreference_note,
                     e.western_numeral_form = rec.western_numeral_form,
                     e.arabic_indic_numeral_form = rec.arabic_indic_numeral_form,
-                    e.numeral_mismatch = rec.numeral_mismatch
+                    e.numeral_mismatch = rec.numeral_mismatch,
+                    e.amount_value = rec.amount_value,
+                    e.amount_currency = rec.amount_currency,
+                    e.source_doc_ids = [rec.source_doc_id],
+                    e.source_pages = [rec.source_page],
+                    e.mention_count = 1
+                ON MATCH SET
+                    e.source_doc_ids = CASE
+                        WHEN rec.source_doc_id IN coalesce(e.source_doc_ids, [])
+                            THEN e.source_doc_ids
+                        ELSE coalesce(e.source_doc_ids, []) + rec.source_doc_id
+                    END,
+                    e.source_pages = CASE
+                        WHEN rec.source_page IN coalesce(e.source_pages, [])
+                            THEN e.source_pages
+                        ELSE coalesce(e.source_pages, []) + rec.source_page
+                    END,
+                    e.mention_count = coalesce(e.mention_count, 1) + 1,
+                    e.numeral_mismatch = CASE
+                        WHEN rec.numeral_mismatch = true THEN true
+                        ELSE e.numeral_mismatch
+                    END,
+                    e.coreference_note = coalesce(e.coreference_note, rec.coreference_note),
+                    e.western_numeral_form = coalesce(e.western_numeral_form, rec.western_numeral_form),
+                    e.arabic_indic_numeral_form = coalesce(e.arabic_indic_numeral_form, rec.arabic_indic_numeral_form),
+                    e.amount_value = coalesce(e.amount_value, rec.amount_value),
+                    e.amount_currency = coalesce(e.amount_currency, rec.amount_currency)
                 WITH e, rec
                 MATCH (d:Document {doc_id: rec.source_doc_id})
                 MERGE (e)-[:FOUND_IN]->(d)
                 """,
                 records=records,
             )
-        logger.info("Stored %d entities in Neo4j", len(entities))
+        logger.info("Stored %d entities in Neo4j (deduped by canonical_id)", len(entities))
 
     _run_with_reconnect(_run)
 
@@ -172,10 +201,14 @@ def store_relationships(relationships: list[Relationship]) -> None:
                 MATCH (src:Entity {entity_id: rec.source_entity_id})
                 MATCH (tgt:Entity {entity_id: rec.target_entity_id})
                 MERGE (src)-[r:RELATES {rel_id: rec.rel_id}]->(tgt)
-                SET r.relationship_type = rec.relationship_type,
+                ON CREATE SET
+                    r.relationship_type = rec.relationship_type,
                     r.source_doc_id = rec.source_doc_id,
                     r.source_page = rec.source_page,
-                    r.confidence = rec.confidence
+                    r.confidence = rec.confidence,
+                    r.mention_count = 1
+                ON MATCH SET
+                    r.mention_count = coalesce(r.mention_count, 1) + 1
                 """,
                 records=records,
             )
@@ -236,9 +269,26 @@ def find_contradictions(doc_ids: list[str]) -> list[dict]:
                   AND d1.doc_id <> d2.doc_id
                   AND d1.doc_id IN $doc_ids
                   AND d2.doc_id IN $doc_ids
-                  AND e1.normalized_value <> e2.normalized_value
                   AND NOT coalesce(e1.amount_role, 'unknown') IN ['opening_balance', 'closing_balance']
                   AND NOT coalesce(e2.amount_role, 'unknown') IN ['opening_balance', 'closing_balance']
+                  // Currency must match when both are known (USD vs EGP is not a contradiction).
+                  AND (
+                       e1.amount_currency IS NULL
+                    OR e2.amount_currency IS NULL
+                    OR e1.amount_currency = e2.amount_currency
+                  )
+                  // Distinct amounts: prefer numeric compare with tolerance; fall back to string.
+                  AND (
+                    (e1.amount_value IS NOT NULL AND e2.amount_value IS NOT NULL
+                       AND abs(e1.amount_value - e2.amount_value) >
+                           CASE
+                             WHEN abs(e1.amount_value) > abs(e2.amount_value) THEN abs(e1.amount_value) * 0.0001 + 0.01
+                             ELSE abs(e2.amount_value) * 0.0001 + 0.01
+                           END)
+                    OR
+                    ((e1.amount_value IS NULL OR e2.amount_value IS NULL)
+                       AND e1.normalized_value <> e2.normalized_value)
+                  )
                 MATCH (e1)-[:RELATES]-(anchor:Entity)-[:RELATES]-(e2)
                 WHERE anchor.entity_type <> 'amount'
                 RETURN e1.entity_id AS entity1_id,
@@ -247,6 +297,10 @@ def find_contradictions(doc_ids: list[str]) -> list[dict]:
                        e2.value AS value2,
                        e1.normalized_value AS norm1,
                        e2.normalized_value AS norm2,
+                       e1.amount_value AS amount_value1,
+                       e2.amount_value AS amount_value2,
+                       e1.amount_currency AS currency1,
+                       e2.amount_currency AS currency2,
                        coalesce(e1.amount_role, 'unknown') AS role1,
                        coalesce(e2.amount_role, 'unknown') AS role2,
                        anchor.entity_id AS anchor_entity_id,

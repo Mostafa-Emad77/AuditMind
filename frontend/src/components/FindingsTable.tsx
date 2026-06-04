@@ -2,24 +2,30 @@
 
 import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import {
-  AlertTriangle,
-  AlertCircle,
-  CheckCircle2,
-  ChevronDown,
-  ChevronRight,
-  FileText,
-  PanelRight,
-} from "lucide-react";
-import { cn, severityBg } from "@/lib/utils";
+import { CheckCircle2 } from "lucide-react";
+import { cn } from "@/lib/utils";
 import type { Finding, Severity } from "@/types";
 
-const SEVERITY_ICONS: Record<Severity, React.ReactNode> = {
-  critical: <AlertCircle className="h-4 w-4 text-red-400 shrink-0" />,
-  warning: <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0" />,
-  ok: <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />,
+/* ── severity helpers ── */
+const SEVERITY_BADGE: Record<Severity, string> = {
+  critical: "bg-red-50 text-red-700 border-red-200",
+  warning: "bg-amber-50 text-amber-700 border-amber-200",
+  ok: "bg-emerald-50 text-emerald-700 border-emerald-200",
 };
 
+const SEVERITY_ROW_SELECTED: Record<Severity, string> = {
+  critical: "bg-red-50/60",
+  warning: "bg-amber-50/60",
+  ok: "bg-emerald-50/60",
+};
+
+const SEVERITY_ICON: Record<Severity, string> = {
+  critical: "error",
+  warning: "warning",
+  ok: "check_circle",
+};
+
+/* ── individual row ── */
 interface FindingRowProps {
   finding: Finding;
   index: number;
@@ -30,144 +36,118 @@ function FindingRow({ finding, index, onOpenDetail }: FindingRowProps) {
   const [isExpanded, setIsExpanded] = useState(finding.severity === "critical");
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 8 }}
+    <motion.tr
+      initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.2, delay: index * 0.05 }}
+      transition={{ duration: 0.2, delay: index * 0.04 }}
       className={cn(
-        "rounded-lg border overflow-hidden transition-all",
-        finding.severity === "critical" && "border-red-400/30",
-        finding.severity === "warning" && "border-amber-400/30",
-        finding.severity === "ok" && "border-emerald-400/30"
+        "border-b border-outline-variant hover:bg-secondary transition-colors cursor-pointer",
+        isExpanded && SEVERITY_ROW_SELECTED[finding.severity]
       )}
     >
-      {/* Header row */}
-      <div className="flex items-stretch">
-        <button
-          type="button"
+      {/* Expand / detail in a nested structure */}
+      <td colSpan={5} className="p-0">
+        {/* Header row */}
+        <div
+          className="flex items-center gap-0 cursor-pointer"
           onClick={() => setIsExpanded(!isExpanded)}
-          className={cn(
-            "flex-1 flex items-start gap-3 p-3 text-left transition-colors hover:bg-accent/30",
-            finding.severity === "critical" && "bg-red-400/5",
-            finding.severity === "warning" && "bg-amber-400/5",
-            finding.severity === "ok" && "bg-emerald-400/5"
-          )}
         >
-          {SEVERITY_ICONS[finding.severity]}
-          <div className="flex-1 min-w-0">
-            <div className="flex items-start justify-between gap-2">
-              <p className="text-sm font-medium leading-tight">{finding.title}</p>
-              <div className="flex items-center gap-2 shrink-0">
-                <span
-                  className={cn(
-                    "text-[10px] font-semibold px-2 py-0.5 rounded-full border",
-                    severityBg(finding.severity)
-                  )}
-                >
-                  {finding.severity.toUpperCase()}
-                </span>
-                <span className="text-[10px] text-muted-foreground">
-                  {Math.round(finding.confidence_score * 100)}% confidence
-                </span>
-              </div>
-            </div>
+          {/* Priority badge */}
+          <div className="py-2 px-4 w-[130px] shrink-0">
+            <span className={cn(
+              "inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[11px] font-bold",
+              SEVERITY_BADGE[finding.severity]
+            )}>
+              <span className="material-symbols-outlined text-[12px]">{SEVERITY_ICON[finding.severity]}</span>
+              {finding.severity.charAt(0).toUpperCase() + finding.severity.slice(1)}
+            </span>
           </div>
-          {isExpanded ? (
-            <ChevronDown className="h-4 w-4 text-muted-foreground shrink-0 mt-0.5" />
-          ) : (
-            <ChevronRight className="h-4 w-4 text-muted-foreground shrink-0 mt-0.5" />
-          )}
-        </button>
-        {onOpenDetail && (
-          <button
-            type="button"
-            title="Evidence and sources"
-            className="px-3 border-l border-border/50 hover:bg-accent/50 text-muted-foreground hover:text-foreground shrink-0 flex items-center justify-center"
-            onClick={() => onOpenDetail(finding)}
-          >
-            <PanelRight className="h-4 w-4" />
-          </button>
-        )}
-      </div>
-
-      {/* Expanded details */}
-      <AnimatePresence>
-        {isExpanded && (
-          <motion.div
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: "auto", opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.2 }}
-            className="overflow-hidden"
-          >
-            <div className="px-4 pb-4 pt-2 space-y-3 border-t border-border/50">
-              {/* Description */}
-              <p
-                className="text-sm text-foreground/80 leading-relaxed"
-                dir={finding.description.match(/[\u0600-\u06FF]/) ? "rtl" : "ltr"}
+          {/* Description */}
+          <div className="flex-1 py-2 px-4 text-[13px] text-foreground font-medium min-w-0">
+            {finding.title}
+          </div>
+          {/* Confidence */}
+          <div className="py-2 px-4 w-[100px] text-right font-mono text-[13px] font-medium text-primary tabular-nums shrink-0">
+            {Math.round(finding.confidence_score * 100)}%
+          </div>
+          {/* Source */}
+          <div className="py-2 px-4 w-[160px] shrink-0">
+            {finding.source_doc_id && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-muted text-foreground text-[11px] rounded border border-outline-variant">
+                <span className="material-symbols-outlined text-[12px]">description</span>
+                {finding.source_doc_id.slice(0, 8)}…
+              </span>
+            )}
+          </div>
+          {/* Detail button */}
+          <div className="py-2 px-4 w-10 text-right shrink-0">
+            {onOpenDetail ? (
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); onOpenDetail(finding); }}
+                className="text-primary hover:text-[#003ea8] transition-colors"
               >
-                {finding.description}
-              </p>
+                <span className="material-symbols-outlined text-[20px]">chevron_right</span>
+              </button>
+            ) : (
+              <span className="material-symbols-outlined text-[20px] text-outline-variant">
+                {isExpanded ? "expand_less" : "expand_more"}
+              </span>
+            )}
+          </div>
+        </div>
 
-              {/* Evidence */}
-              {finding.evidence.length > 0 && (
-                <div>
-                  <p className="text-xs font-medium text-muted-foreground mb-1.5">Evidence:</p>
-                  <div className="space-y-1">
-                    {finding.evidence.map((e, i) => (
-                      <div
-                        key={i}
-                        className="flex items-start gap-2 text-xs bg-secondary/40 px-2.5 py-1.5 rounded"
-                      >
-                        <FileText className="h-3 w-3 text-muted-foreground mt-0.5 shrink-0" />
-                        <span
-                          className="text-foreground/70"
-                          dir={e.match(/[\u0600-\u06FF]/) ? "rtl" : "ltr"}
-                        >
-                          {e}
-                        </span>
-                      </div>
-                    ))}
+        {/* Expanded details */}
+        <AnimatePresence>
+          {isExpanded && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: "auto", opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              className="overflow-hidden border-t border-outline-variant"
+            >
+              <div className="px-4 pb-4 pt-3 ml-[130px] space-y-3">
+                <p
+                  className="text-[13px] text-on-surface-variant leading-relaxed"
+                  dir={finding.description.match(/[\u0600-\u06FF]/) ? "rtl" : "ltr"}
+                >
+                  {finding.description}
+                </p>
+                {finding.evidence.length > 0 && (
+                  <div>
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground mb-2">Evidence</p>
+                    <div className="space-y-1.5">
+                      {finding.evidence.map((e, i) => (
+                        <div key={i} className="flex items-start gap-2 text-[12px] bg-muted/50 border border-outline-variant px-3 py-2 rounded">
+                          <span className="material-symbols-outlined text-[13px] text-muted-foreground mt-0.5">description</span>
+                          <span className="text-muted-foreground" dir={e.match(/[\u0600-\u06FF]/) ? "rtl" : "ltr"}>{e}</span>
+                        </div>
+                      ))}
+                    </div>
                   </div>
-                </div>
-              )}
-
-              {/* Source citations */}
-              {(finding.source_doc_id || finding.conflicting_doc_id) && (
-                <div className="flex flex-wrap gap-2 text-[10px]">
-                  {finding.source_doc_id && (
-                    <span className="px-2 py-1 bg-secondary rounded border border-border text-muted-foreground font-mono">
-                      Doc: {finding.source_doc_id.slice(0, 8)}...{finding.source_page ? ` p.${finding.source_page}` : ""}
-                    </span>
-                  )}
-                  {finding.conflicting_doc_id && (
-                    <span className="px-2 py-1 bg-secondary rounded border border-border text-muted-foreground font-mono">
-                      Conflicts with: {finding.conflicting_doc_id.slice(0, 8)}...{finding.conflicting_page ? ` p.${finding.conflicting_page}` : ""}
-                    </span>
-                  )}
-                </div>
-              )}
-
-              {/* Recommendation */}
-              {finding.recommendation && (
-                <div className="flex items-start gap-2 p-2.5 rounded bg-primary/5 border border-primary/20">
-                  <span className="text-primary text-xs shrink-0">💡</span>
-                  <p
-                    className="text-xs text-primary/80"
-                    dir={finding.recommendation.match(/[\u0600-\u06FF]/) ? "rtl" : "ltr"}
-                  >
-                    {finding.recommendation}
-                  </p>
-                </div>
-              )}
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </motion.div>
+                )}
+                {finding.recommendation && (
+                  <div className="flex items-start gap-2 p-3 rounded-lg bg-blue-50 border border-blue-100">
+                    <span className="material-symbols-outlined text-[16px] text-primary shrink-0 mt-0.5">smart_toy</span>
+                    <p
+                      className="text-[12px] text-foreground"
+                      dir={finding.recommendation.match(/[\u0600-\u06FF]/) ? "rtl" : "ltr"}
+                    >
+                      {finding.recommendation}
+                    </p>
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </td>
+    </motion.tr>
   );
 }
 
+/* ── main table ── */
 interface FindingsTableProps {
   findings: Finding[];
   isLoading?: boolean;
@@ -180,15 +160,13 @@ export function FindingsTable({ findings, isLoading, onOpenDetail }: FindingsTab
   const critical = findings.filter((f) => f.severity === "critical");
   const warnings = findings.filter((f) => f.severity === "warning");
   const ok = findings.filter((f) => f.severity === "ok");
-
-  const filtered =
-    filter === "all" ? findings : findings.filter((f) => f.severity === filter);
+  const filtered = filter === "all" ? findings : findings.filter((f) => f.severity === filter);
 
   if (isLoading) {
     return (
-      <div className="space-y-2">
+      <div className="bg-white border border-outline-variant rounded-lg overflow-hidden">
         {[1, 2, 3].map((i) => (
-          <div key={i} className="h-16 rounded-lg shimmer" />
+          <div key={i} className="h-12 border-b border-outline-variant shimmer last:border-0" />
         ))}
       </div>
     );
@@ -196,8 +174,8 @@ export function FindingsTable({ findings, isLoading, onOpenDetail }: FindingsTab
 
   if (findings.length === 0) {
     return (
-      <div className="flex flex-col items-center justify-center py-12 text-center">
-        <CheckCircle2 className="h-8 w-8 text-muted-foreground/30 mb-3" />
+      <div className="flex flex-col items-center justify-center py-16 text-center bg-white border border-outline-variant rounded-lg">
+        <CheckCircle2 className="h-8 w-8 text-muted-foreground/40 mb-3" />
         <p className="text-sm text-muted-foreground">No findings yet</p>
         <p className="text-xs text-muted-foreground/60 mt-1">
           Findings will appear here as the audit progresses
@@ -207,42 +185,55 @@ export function FindingsTable({ findings, isLoading, onOpenDetail }: FindingsTab
   }
 
   return (
-    <div className="space-y-3">
-      {/* Summary stats */}
-      <div className="flex items-center gap-2 flex-wrap">
+    <div className="space-y-4">
+      {/* Filter tabs */}
+      <div className="flex items-center gap-1.5 flex-wrap">
         {[
-          { label: "All", value: "all", count: findings.length, color: "text-foreground" },
-          { label: "Critical", value: "critical", count: critical.length, color: "text-red-400" },
-          { label: "Warning", value: "warning", count: warnings.length, color: "text-amber-400" },
-          { label: "OK", value: "ok", count: ok.length, color: "text-emerald-400" },
-        ].map(({ label, value, count, color }) => (
+          { label: "All", value: "all", count: findings.length },
+          { label: "Critical", value: "critical", count: critical.length },
+          { label: "Warning", value: "warning", count: warnings.length },
+          { label: "Info", value: "ok", count: ok.length },
+        ].map(({ label, value, count }) => (
           <button
             key={value}
             onClick={() => setFilter(value as typeof filter)}
             className={cn(
-              "flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border transition-all",
+              "flex items-center gap-1.5 px-3 py-1 rounded text-xs font-semibold uppercase tracking-wide border transition-all",
               filter === value
-                ? "bg-primary/10 border-primary/30 text-primary"
-                : "bg-secondary border-border text-muted-foreground hover:border-primary/30"
+                ? "bg-primary text-white border-primary"
+                : "bg-white text-muted-foreground border-outline-variant hover:bg-secondary"
             )}
           >
-            <span className={color}>{count}</span>
-            <span>{label}</span>
+            {count} {label}
           </button>
         ))}
       </div>
 
-      {/* Finding rows */}
-      <div className="space-y-2">
-        {filtered.map((finding, i) => (
-          <FindingRow
-            key={finding.finding_id}
-            finding={finding}
-            index={i}
-            onOpenDetail={onOpenDetail}
-          />
-        ))}
+      {/* Table */}
+      <div className="bg-white border border-outline-variant rounded-lg overflow-hidden">
+        <table className="w-full text-left border-collapse">
+          <thead>
+            <tr className="bg-secondary border-b border-outline-variant">
+              <th className="py-3 px-4 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground w-[130px]">Priority</th>
+              <th className="py-3 px-4 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Description</th>
+              <th className="py-3 px-4 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground text-right w-[100px]">Confidence</th>
+              <th className="py-3 px-4 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground w-[160px]">Source</th>
+              <th className="py-3 px-4 w-10" />
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((finding, i) => (
+              <FindingRow
+                key={finding.finding_id}
+                finding={finding}
+                index={i}
+                onOpenDetail={onOpenDetail}
+              />
+            ))}
+          </tbody>
+        </table>
       </div>
     </div>
   );
 }
+

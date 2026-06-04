@@ -2,28 +2,48 @@
 @tailwind components;
 @tailwind utilities;
 
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
 @layer base {
   :root {
-    --background: 222 47% 7%;
-    --foreground: 210 40% 96%;
-    --card: 222 47% 11%;
-    --card-foreground: 210 40% 96%;
-    --popover: 222 47% 11%;
-    --popover-foreground: 210 40% 96%;
-    --primary: 217 91% 60%;
-    --primary-foreground: 222 47% 7%;
-    --secondary: 222 47% 16%;
-    --secondary-foreground: 210 40% 96%;
-    --muted: 222 47% 16%;
-    --muted-foreground: 215 20% 55%;
-    --accent: 222 47% 18%;
-    --accent-foreground: 210 40% 96%;
-    --destructive: 0 84% 60%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 222 47% 20%;
-    --input: 222 47% 20%;
-    --ring: 217 91% 60%;
-    --radius: 0.5rem;
+    /* Light theme — AuditMind Institutional Design System */
+    --background: 230 100% 99%;       /* #f8f9ff */
+    --foreground: 210 61% 11%;        /* #0b1c30 */
+    --card: 0 0% 100%;                /* #ffffff */
+    --card-foreground: 210 61% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 210 61% 11%;
+    --primary: 222 100% 42%;          /* #0051d5 — Professional Blue */
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 100% 97%;        /* #eff4ff — surface-container-low */
+    --secondary-foreground: 210 61% 11%;
+    --muted: 220 59% 95%;             /* #e5eeff — surface-container */
+    --muted-foreground: 220 5% 43%;   /* #6b6f78 */
+    --accent: 220 72% 94%;            /* #dce9ff — surface-container-high */
+    --accent-foreground: 210 61% 11%;
+    --destructive: 0 72% 41%;         /* #ba1a1a */
+    --destructive-foreground: 0 0% 100%;
+    --border: 240 3% 78%;             /* #c6c6cd — outline-variant */
+    --input: 240 3% 78%;
+    --ring: 222 100% 42%;
+    --radius: 0.25rem;
+
+    /* Extended design tokens */
+    --surface: 230 100% 99%;          /* #f8f9ff */
+    --surface-container-lowest: 0 0% 100%;   /* #ffffff */
+    --surface-container-low: 220 100% 97%;   /* #eff4ff */
+    --surface-container: 220 59% 95%;        /* #e5eeff */
+    --surface-container-high: 220 72% 94%;   /* #dce9ff */
+    --on-surface: 210 61% 11%;               /* #0b1c30 */
+    --on-surface-variant: 240 4% 29%;        /* #45464d */
+    --outline: 240 3% 48%;                   /* #76777d */
+    --outline-variant: 240 3% 78%;           /* #c6c6cd */
+    --navy: 210 61% 11%;                     /* #0b1c30 — deep nav */
+    --primary-container: 210 42% 14%;        /* #131b2e */
+    --error: 0 72% 41%;                      /* #ba1a1a */
+    --error-container: 0 100% 92%;           /* #ffdad6 */
+    --warning-surface: 40 100% 92%;          /* #fcdeb5 — tertiary-fixed */
+    --warning-text: 30 56% 24%;              /* #574425 */
   }
 }
 
@@ -33,6 +53,7 @@
   }
   body {
     @apply bg-background text-foreground;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
     font-feature-settings: "rlig" 1, "calt" 1;
   }
 }
@@ -40,7 +61,8 @@
 /* Arabic text support */
 [lang="ar"], .rtl {
   direction: rtl;
-  font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
+  font-family: 'IBM Plex Sans Arabic', 'Segoe UI', Tahoma, Arial, sans-serif;
+  line-height: 1.8;
 }
 
 /* Reasoning panel streaming shimmer */
@@ -68,16 +90,21 @@
   border-radius: 3px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: hsl(var(--muted-foreground));
+  background: hsl(var(--outline));
 }
 
-/* Severity colors */
+/* Severity badge helpers */
 .severity-critical {
-  @apply text-red-400 bg-red-400/10 border-red-400/30;
+  @apply text-red-700 bg-red-50 border-red-200;
 }
 .severity-warning {
-  @apply text-amber-400 bg-amber-400/10 border-amber-400/30;
+  @apply text-amber-700 bg-amber-50 border-amber-200;
 }
 .severity-ok {
-  @apply text-emerald-400 bg-emerald-400/10 border-emerald-400/30;
+  @apply text-emerald-700 bg-emerald-50 border-emerald-200;
+}
+
+/* Tabular numbers for financial data */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
 }

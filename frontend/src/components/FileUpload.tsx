@@ -2,10 +2,10 @@
 
 import { useState, useCallback } from "react";
 import { useDropzone, type DropEvent, type FileRejection } from "react-dropzone";
-import { Upload, FileText, X, AlertCircle, Languages, Receipt, FileBadge2 } from "lucide-react";
+import { AlertCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { uploadDocuments } from "@/lib/api";
-import type { DocumentMeta, UploadResponse } from "@/types";
+import type { UploadResponse } from "@/types";
 
 interface FileUploadProps {
   onUploadComplete: (response: UploadResponse) => void;
@@ -63,92 +63,91 @@ export function FileUpload({ onUploadComplete }: FileUploadProps) {
   };
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 w-full">
       {/* Drop zone */}
       <div
         {...getRootProps()}
         className={cn(
-          "border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all duration-200 relative overflow-hidden",
+          "border-2 border-dashed rounded-lg p-10 text-center cursor-pointer transition-all",
           isDragActive
-            ? "border-primary bg-primary/10 scale-[1.01] shadow-[0_0_0_3px_rgba(59,130,246,0.15)]"
-            : "border-border hover:border-primary/50 hover:bg-accent/30"
+            ? "border-primary bg-secondary"
+            : "border-outline-variant hover:border-primary/50 hover:bg-secondary/60"
         )}
       >
         <input {...getInputProps()} />
-        {isDragActive && (
-          <div className="absolute inset-0 bg-gradient-to-b from-primary/5 to-transparent pointer-events-none" />
-        )}
         <div className="flex flex-col items-center gap-3">
-          <div className="p-3 rounded-full bg-primary/10">
-            <Upload className="h-6 w-6 text-primary" />
+          <div className="w-14 h-14 bg-muted rounded-full flex items-center justify-center">
+            <span className="material-symbols-outlined text-[28px] text-primary">upload_file</span>
           </div>
           <div>
-            <p className="text-sm font-medium text-foreground">
-              {isDragActive ? "Drop your PDFs here..." : "Drag & drop PDFs here"}
+            <p className="text-base font-semibold text-foreground">
+              {isDragActive ? "Drop your files here..." : "Drag and drop your files here"}
             </p>
-            <p className="text-xs text-muted-foreground mt-1">
-              or click to browse — Arabic & English documents supported
+            <p className="text-sm text-muted-foreground mt-1">
+              Support for PDF, DOCX, and XLSX up to {MAX_SIZE_MB}MB per file.
             </p>
           </div>
-          <p className="text-xs text-muted-foreground">
-            PDF only · Max {MAX_SIZE_MB}MB per file · Multiple files allowed
-          </p>
-          <div className="flex items-center gap-2 pt-1">
-            <span className="inline-flex items-center gap-1 text-[10px] px-2 py-1 rounded-full border border-border bg-secondary/60 text-muted-foreground">
-              <FileBadge2 className="h-3 w-3 text-red-400" />
-              PDF
-            </span>
-            <span className="inline-flex items-center gap-1 text-[10px] px-2 py-1 rounded-full border border-border bg-secondary/60 text-muted-foreground">
-              <Receipt className="h-3 w-3 text-primary" />
-              Invoice / Contract
-            </span>
-          </div>
+          <button
+            type="button"
+            onClick={(e) => e.stopPropagation()}
+            className="bg-[#131b2e] text-white text-sm font-medium px-5 py-2 rounded-lg hover:opacity-90 transition-opacity"
+          >
+            Browse Files
+          </button>
         </div>
       </div>
 
       {/* File list */}
       {files.length > 0 && (
         <div className="space-y-2">
+          <h3 className="text-sm font-semibold text-foreground">Uploaded Documents</h3>
           {files.map((file) => (
             <div
               key={file.name}
-              className="flex items-center gap-3 px-3 py-2 rounded-lg bg-secondary/50 border border-border"
+              className="flex items-center justify-between p-3 border border-outline-variant rounded-lg bg-white hover:bg-secondary transition-colors"
             >
-              <FileText className="h-4 w-4 text-primary shrink-0" />
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium truncate">{file.name}</p>
-                <p className="text-xs text-muted-foreground">
-                  {(file.size / 1024 / 1024).toFixed(2)} MB
-                </p>
+              <div className="flex items-center gap-3">
+                <span className="material-symbols-outlined text-[20px] text-muted-foreground">description</span>
+                <div>
+                  <p className="text-sm font-semibold text-foreground truncate max-w-[200px]">{file.name}</p>
+                  <p className="text-xs text-muted-foreground">{(file.size / 1024 / 1024).toFixed(2)} MB</p>
+                </div>
               </div>
-              <button
-                onClick={() => removeFile(file.name)}
-                className="p-1 rounded hover:bg-destructive/20 text-muted-foreground hover:text-destructive transition-colors"
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
+              <div className="flex items-center gap-3">
+                <span className="inline-flex items-center gap-1 bg-green-50 text-green-700 border border-green-200 px-2 py-0.5 rounded-full text-[10px] font-semibold">
+                  <span className="material-symbols-outlined text-[12px]">check_circle</span>
+                  Ready
+                </span>
+                <button
+                  onClick={() => removeFile(file.name)}
+                  className="text-muted-foreground hover:text-destructive transition-colors"
+                >
+                  <span className="material-symbols-outlined text-[20px]">delete</span>
+                </button>
+              </div>
             </div>
           ))}
         </div>
       )}
 
-      {/* Report language selector */}
-      <div className="flex items-center gap-3 p-3 rounded-lg bg-secondary/30 border border-border">
-        <Languages className="h-4 w-4 text-primary shrink-0" />
-        <span className="text-sm text-muted-foreground">Report language:</span>
-        <div className="flex gap-2 ml-auto">
+      {/* Report language */}
+      <div className="flex items-center gap-3">
+        <span className="text-[12px] font-semibold uppercase tracking-wide text-muted-foreground">
+          Report Language:
+        </span>
+        <div className="flex gap-2">
           {(["english", "arabic"] as const).map((lang) => (
             <button
               key={lang}
               onClick={() => setReportLanguage(lang)}
               className={cn(
-                "px-3 py-1 rounded text-xs font-medium transition-all",
+                "px-3 py-1.5 rounded-lg text-sm font-medium transition-all border",
                 reportLanguage === lang
-                  ? "bg-primary text-primary-foreground"
-                  : "bg-secondary text-muted-foreground hover:bg-accent"
+                  ? "bg-primary text-white border-primary"
+                  : "bg-white text-muted-foreground border-outline-variant hover:bg-secondary"
               )}
             >
-              {lang === "english" ? "🇬🇧 English" : "🇪🇬 Arabic"}
+              {lang === "english" ? "English" : "Arabic"}
             </button>
           ))}
         </div>
@@ -156,32 +155,36 @@ export function FileUpload({ onUploadComplete }: FileUploadProps) {
 
       {/* Error */}
       {error && (
-        <div className="flex items-start gap-2 p-3 rounded-lg bg-destructive/10 border border-destructive/30 text-destructive text-sm">
+        <div className="flex items-start gap-2 p-3 rounded-lg bg-red-50 border border-red-200 text-red-700 text-sm">
           <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
           {error}
         </div>
       )}
 
-      {/* Upload button */}
+      {/* Start Audit button */}
       <button
         onClick={handleUpload}
         disabled={files.length === 0 || isUploading}
         className={cn(
-          "w-full py-3 px-4 rounded-xl font-medium text-sm transition-all duration-200",
+          "w-full py-3 px-4 rounded-lg font-semibold text-sm transition-all flex items-center justify-center gap-2",
           files.length === 0 || isUploading
-            ? "bg-secondary text-muted-foreground cursor-not-allowed"
-            : "bg-gradient-to-r from-primary to-blue-500 text-white hover:brightness-110 shadow-lg shadow-primary/30 hover:shadow-primary/50"
+            ? "bg-muted text-muted-foreground cursor-not-allowed"
+            : "bg-primary text-white hover:bg-[#003ea8]"
         )}
       >
         {isUploading ? (
-          <span className="flex items-center justify-center gap-2">
-            <span className="h-4 w-4 rounded-full border-2 border-primary-foreground border-t-transparent animate-spin" />
+          <>
+            <span className="h-4 w-4 rounded-full border-2 border-white border-t-transparent animate-spin" />
             Processing documents...
-          </span>
+          </>
         ) : (
-          `Start Audit${files.length > 0 ? ` (${files.length} file${files.length > 1 ? "s" : ""})` : ""}`
+          <>
+            <span className="material-symbols-outlined text-[18px]">play_arrow</span>
+            {`Start Audit${files.length > 0 ? ` (${files.length} file${files.length > 1 ? "s" : ""})` : ""}`}
+          </>
         )}
       </button>
     </div>
   );
 }
+

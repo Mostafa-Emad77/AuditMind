@@ -7,7 +7,6 @@ from langchain_core.messages import AIMessage
 from app.models.state import AuditState
 from app.models.schemas import ReasoningStep, ChecklistItem
 from app.tools.planner_tools import generate_checklist
-from app.utils.llm_factory import get_llm
 
 logger = logging.getLogger(__name__)
 

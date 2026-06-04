@@ -1,211 +1,135 @@
 "use client";
 
-import { useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
-import { Brain, FileSearch, ChevronRight, ShieldAlert, Scale, CheckCircle2 } from "lucide-react";
+import Image from "next/image";
 import { FileUpload } from "@/components/FileUpload";
 import type { UploadResponse } from "@/types";
 
 export default function HomePage() {
-  const [showHowItWorks, setShowHowItWorks] = useState(true);
-  const GITHUB_URL = "https://github.com";
-
   const handleUploadComplete = (response: UploadResponse) => {
-    // Navigate to audit page
     window.location.href = `/audit/${response.audit_id}`;
   };
 
   return (
-    <div className="min-h-screen bg-background flex flex-col relative overflow-hidden">
-      <div className="pointer-events-none absolute inset-0 opacity-20 [background-image:radial-gradient(circle_at_1px_1px,hsl(var(--border))_1px,transparent_0)] [background-size:28px_28px]" />
-      {/* Top nav */}
-      <nav className="border-b border-border px-6 py-4 relative z-10">
-        <div className="max-w-7xl mx-auto flex items-center justify-between">
-          <div className="flex items-center gap-2.5">
-            <div className="p-1.5 rounded-lg bg-primary/10">
-              <Brain className="h-5 w-5 text-primary" />
+    <div className="min-h-screen bg-background flex flex-col">
+      {/* Top navigation */}
+      <nav className="bg-white border-b border-outline-variant px-6 py-3">
+        <div className="flex justify-between items-center w-full max-w-[1440px] mx-auto">
+          <div className="flex items-center gap-6">
+            <div className="flex items-center gap-2 text-xl font-bold tracking-tight text-foreground">
+              <Image src="/logo.png" alt="AuditMind Logo" width={32} height={32} className="object-contain" />
+              AuditMind
             </div>
-            <span className="font-bold text-base tracking-tight">AuditMind</span>
+            <div className="hidden md:flex gap-1 ml-4">
+              <a href="#" className="text-primary border-b-2 border-primary pb-0.5 text-sm font-medium px-2 py-1">
+                Dashboard
+              </a>
+              {["Workpapers", "Analytics", "Archive"].map((link) => (
+                <a
+                  key={link}
+                  href="#"
+                  className="text-muted-foreground hover:text-foreground text-sm transition-colors px-2 py-1 rounded hover:bg-secondary"
+                >
+                  {link}
+                </a>
+              ))}
+            </div>
           </div>
-          <div className="hidden md:flex items-center gap-5 text-xs text-muted-foreground">
-            <a href="#features" className="hover:text-foreground transition-colors">Features</a>
-            <a href="#how-it-works" className="hover:text-foreground transition-colors">How it Works</a>
-            <a href="#upload" className="hover:text-foreground transition-colors">Start Audit</a>
-            <a
-              href={GITHUB_URL}
-              target="_blank"
-              rel="noreferrer"
-              className="text-primary hover:text-primary/80 transition-colors"
-            >
-              GitHub
-            </a>
+          <div className="flex items-center gap-1 text-muted-foreground">
+            {["language", "settings", "notifications"].map((icon) => (
+              <button
+                key={icon}
+                className="p-2 hover:bg-secondary rounded-full transition-colors"
+                aria-label={icon}
+              >
+                <span className="material-symbols-outlined text-[22px]">{icon}</span>
+              </button>
+            ))}
+            <div className="ml-1 h-8 w-8 bg-muted rounded-full flex items-center justify-center border border-outline-variant overflow-hidden">
+              <span className="material-symbols-outlined text-muted-foreground">person</span>
+            </div>
           </div>
         </div>
       </nav>
 
-      {/* Hero + upload */}
-      <main className="flex-1 flex items-center justify-center px-6 py-12 relative z-10">
-        <div className="w-full max-w-7xl grid grid-cols-1 xl:grid-cols-[300px_minmax(0,760px)_300px] gap-8 items-start">
-          <aside className="hidden xl:block rounded-2xl border border-border bg-card/50 p-4">
-            <h3 className="text-sm font-semibold mb-3 flex items-center gap-2">
-              <ShieldAlert className="h-4 w-4 text-amber-400" />
-              Sample Finding
-            </h3>
-            <div className="rounded-lg border border-amber-400/30 bg-amber-400/5 p-3 space-y-2">
-              <p className="text-xs font-medium text-amber-300">Amount mismatch detected</p>
-              <p className="text-xs text-muted-foreground">
-                Invoice shows <span className="text-foreground">50,000 EGP</span> while contract shows <span className="text-foreground">45,000 EGP</span>.
-              </p>
-              <p className="text-[11px] text-amber-200/80">Confidence: 92%</p>
-            </div>
-            <p className="text-[11px] text-muted-foreground mt-3">
-              Real audits surface issues like this automatically.
-            </p>
-          </aside>
+      {/* Main content */}
+      <main className="flex-1 flex flex-col items-center pt-10 pb-12 px-6 max-w-[1440px] mx-auto w-full">
+        {/* Hero */}
+        <section className="text-center mb-10 max-w-3xl w-full">
+          <h1 className="text-[32px] leading-10 font-bold tracking-tight text-foreground mb-3">
+            AI-Powered Precision for Financial Audits
+          </h1>
+          <p className="text-base text-muted-foreground leading-6">
+            Streamline your verification process with automated data extraction,
+            cross-referencing, and anomaly detection. Upload your documents to begin.
+          </p>
+        </section>
 
-          <div className="w-full max-w-3xl mx-auto">
-          {/* Hero */}
-          <motion.div
-            initial={{ opacity: 0, y: 16 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.4 }}
-            className="text-center mb-10"
-          >
-            <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-primary/10 border border-primary/20 text-primary text-xs font-medium mb-6">
-              <Brain className="h-3.5 w-3.5" />
-              Powered by LangGraph + GraphRAG
-            </div>
-            <h1 className="text-4xl font-bold tracking-tight mb-4 bg-gradient-to-b from-foreground to-foreground/60 bg-clip-text text-transparent">
-              Audit financial documents
-              <br />
-              <span className="text-primary">in Arabic and English</span>
-            </h1>
-            <p className="text-muted-foreground text-base max-w-lg mx-auto leading-relaxed">
-              Upload invoices, contracts, bank statements, and balance sheets.
-              Our AI agents will autonomously detect contradictions, verify consistency,
-              and produce a bilingual audit report — with every reasoning step visible.
-            </p>
-          </motion.div>
-
-          {/* Feature pills */}
-          <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.4, delay: 0.1 }}
-            className="space-y-3 mb-8"
-            id="features"
-          >
-            <div className="flex items-center justify-center gap-2 flex-wrap">
-              <span className="text-[11px] text-muted-foreground">Powered by:</span>
-              {["LangGraph", "GraphRAG", "Neo4j", "Qdrant"].map((feat) => (
-                <span
-                  key={feat}
-                  className="text-xs px-2.5 py-1 rounded-full bg-secondary border border-border text-muted-foreground"
-                >
-                  {feat}
-                </span>
-              ))}
-            </div>
-            <div className="flex items-center justify-center gap-2 flex-wrap">
-              <span className="text-[11px] text-muted-foreground">Features:</span>
-              {[
-                "Cross-document contradiction detection",
-                "Live chain-of-thought reasoning",
-                "Arabic + English OCR",
-                "Hybrid vector + graph search",
-              ].map((feat) => (
-                <span
-                  key={feat}
-                  className="text-xs px-2.5 py-1 rounded-full bg-secondary border border-border text-muted-foreground"
-                >
-                  {feat}
-                </span>
-              ))}
-            </div>
-          </motion.div>
-
-          {/* Upload card */}
-          <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.4, delay: 0.15 }}
-            className="rounded-2xl border border-border bg-card p-6 shadow-2xl shadow-black/30"
-            id="upload"
-          >
-            <div className="flex items-center gap-2 mb-5">
-              <FileSearch className="h-4 w-4 text-primary" />
-              <h2 className="text-sm font-semibold">Upload Documents to Audit</h2>
-            </div>
+        {/* Bento Grid */}
+        <div className="grid grid-cols-1 md:grid-cols-12 gap-5 w-full max-w-5xl">
+          {/* Upload zone — 8 cols */}
+          <div className="col-span-1 md:col-span-8 bg-white border border-outline-variant rounded-xl p-8 flex flex-col justify-center min-h-[300px]">
             <FileUpload onUploadComplete={handleUploadComplete} />
-          </motion.div>
-
-          {/* How it works */}
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            transition={{ duration: 0.4, delay: 0.3 }}
-            className="mt-10"
-            id="how-it-works"
-          >
-            <button
-              className="mx-auto block text-center text-xs text-muted-foreground mb-4 hover:text-foreground transition-colors"
-              onClick={() => setShowHowItWorks((prev) => !prev)}
-            >
-              {showHowItWorks ? "Hide workflow" : "How it works"}
-            </button>
-            <AnimatePresence initial={false}>
-            {showHowItWorks && (
-              <motion.div
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: "auto" }}
-                exit={{ opacity: 0, height: 0 }}
-                transition={{ duration: 0.2 }}
-              >
-            <div className="flex items-center justify-center gap-0 flex-wrap">
-              {[
-                { icon: "📤", label: "Upload PDFs" },
-                { icon: "📄", label: "OCR & Extract" },
-                { icon: "🧠", label: "Build Graph" },
-                { icon: "🔍", label: "Cross-Check" },
-                { icon: "📊", label: "Audit Report" },
-              ].map((step, i) => (
-                <div key={step.label} className="flex items-center">
-                  <div className="flex flex-col items-center gap-1 px-3 py-2">
-                    <span className="text-lg">{step.icon}</span>
-                    <span className="text-[10px] text-muted-foreground whitespace-nowrap">{step.label}</span>
-                  </div>
-                  {i < 4 && <ChevronRight className="h-3 w-3 text-muted-foreground/40 mx-0.5" />}
-                </div>
-              ))}
-            </div>
-              </motion.div>
-            )}
-            </AnimatePresence>
-          </motion.div>
           </div>
 
-          <aside className="hidden xl:block rounded-2xl border border-border bg-card/50 p-4">
-            <h3 className="text-sm font-semibold mb-3 flex items-center gap-2">
-              <Scale className="h-4 w-4 text-primary" />
-              Cross-document reconciliation
-            </h3>
-            <ul className="space-y-2.5 text-xs text-muted-foreground leading-relaxed">
-              <li className="flex items-start gap-2">
-                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400 shrink-0 mt-0.5" />
-                Automatically surfaces financial discrepancies across contracts, invoices, and statements
-              </li>
-              <li className="flex items-start gap-2">
-                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400 shrink-0 mt-0.5" />
-                Flags entity conflicts including legal name mismatches and unauthorized payees
-              </li>
-              <li className="flex items-start gap-2">
-                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400 shrink-0 mt-0.5" />
-                Every finding linked to exact source passages in original documents
-              </li>
-            </ul>
-          </aside>
+          {/* Config + action — 4 cols */}
+          <div className="col-span-1 md:col-span-4 flex flex-col gap-5">
+            {/* Audit configuration card */}
+            <div className="bg-white border border-outline-variant rounded-xl p-4 flex flex-col gap-4">
+              <div className="flex items-center gap-2">
+                <span className="material-symbols-outlined text-[20px] text-muted-foreground">tune</span>
+                <h3 className="text-base font-semibold text-foreground">Audit Configuration</h3>
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <label className="text-[12px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  Document Language
+                </label>
+                <div className="flex bg-accent rounded-lg p-1 gap-1">
+                  <button className="flex-1 text-center py-1.5 bg-white rounded-md shadow-sm text-sm font-medium text-foreground">
+                    English
+                  </button>
+                  <button className="flex-1 text-center py-1.5 text-muted-foreground text-sm hover:text-foreground transition-colors rounded-md">
+                    Arabic
+                  </button>
+                </div>
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <label className="text-[12px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  Extraction Model
+                </label>
+                <select className="w-full bg-white border border-outline-variant rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary focus:ring-1 focus:ring-primary outline-none">
+                  <option>Standard Financial (Fast)</option>
+                  <option>Deep Analysis (Thorough)</option>
+                  <option>Invoice Specific</option>
+                </select>
+              </div>
+            </div>
+
+            {/* Feature highlights card */}
+            <div className="bg-secondary border border-accent rounded-xl p-4 flex flex-col gap-3 flex-grow">
+              <p className="text-sm text-muted-foreground leading-relaxed">
+                Upload invoices, contracts, and bank statements. AI agents automatically
+                detect contradictions and produce a bilingual audit report.
+              </p>
+              <ul className="space-y-2 text-xs text-muted-foreground">
+                {[
+                  "Cross-document contradiction detection",
+                  "Arabic & English OCR support",
+                  "Live chain-of-thought reasoning",
+                  "Graph-based entity reconciliation",
+                ].map((feat) => (
+                  <li key={feat} className="flex items-start gap-2">
+                    <span className="material-symbols-outlined text-primary text-[14px] mt-0.5">check_circle</span>
+                    {feat}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
         </div>
       </main>
+
+      {/* Material Symbols font */}
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0&display=swap');`}</style>
     </div>
   );
 }

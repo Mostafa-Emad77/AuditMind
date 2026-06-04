@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -34,8 +35,10 @@ from app.services.redis_store import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
 
-# Thread pool for CPU-bound work (OCR, embedding) so it doesn't block the event loop
-_executor = ThreadPoolExecutor(max_workers=2)
+# Thread pool for CPU-bound work (OCR, embedding) so it doesn't block the event loop.
+# OCR is the bottleneck on multi-doc uploads; size to the core count so concurrent
+# ingestion (asyncio.gather below) actually utilizes the machine.
+_executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
 
 
 @asynccontextmanager
@@ -118,20 +121,24 @@ async def upload_documents(
             raise HTTPException(status_code=400, detail=f"File '{file.filename}' is empty.")
         file_payloads.append((file.filename, content))
 
-    # Run CPU-heavy ingestion (OCR + embedding) in thread pool
+    # Run CPU-heavy ingestion (OCR + embedding) concurrently in the thread pool.
     loop = asyncio.get_running_loop()
+    tasks = [
+        loop.run_in_executor(_executor, ingest_document, content, filename)
+        for filename, content in file_payloads
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
     document_metas = []
-    for filename, content in file_payloads:
-        try:
-            meta = await loop.run_in_executor(_executor, ingest_document, content, filename)
-            document_metas.append(meta)
-            logger.info("Ingested document '%s' for audit %s", filename, audit_id)
-        except Exception as e:
-            logger.error("Failed to ingest '%s': %s", filename, e)
+    for (filename, _content), result in zip(file_payloads, results):
+        if isinstance(result, Exception):
+            logger.error("Failed to ingest '%s': %s", filename, result)
             raise HTTPException(
                 status_code=500,
-                detail=f"Failed to process '{filename}': {str(e)}",
+                detail=f"Failed to process '{filename}': {str(result)}",
             )
+        document_metas.append(result)
+        logger.info("Ingested document '%s' for audit %s", filename, audit_id)
 
     session = AuditSession(
         audit_id=audit_id,
@@ -170,6 +177,12 @@ async def stream_audit(audit_id: str):
         raise HTTPException(
             status_code=409,
             detail="This audit session has already completed. Retrieve the report instead.",
+        )
+
+    if session.status == "processing":
+        raise HTTPException(
+            status_code=409,
+            detail="Audit is already running. Connect to the existing stream or wait for it to complete.",
         )
 
     # Mark as processing and persist immediately
