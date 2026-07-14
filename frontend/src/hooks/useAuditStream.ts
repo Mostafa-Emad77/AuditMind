@@ -63,10 +63,12 @@ export function useAuditStream(auditId: string | null): AuditStreamState {
 
   useEffect(() => {
     if (!auditId) return;
+    const id: string = auditId;
 
     // Clean up any existing connection
     if (esRef.current) {
       esRef.current.close();
+      esRef.current = null;
     }
 
     setSteps([]);
@@ -78,90 +80,140 @@ export function useAuditStream(auditId: string | null): AuditStreamState {
     setError(null);
     setAgentStatuses(initialAgentStatuses());
 
-    getAuditStatus(auditId)
-      .then((s: { documents?: SessionDocumentRef[] }) => {
-        setSessionDocuments(s.documents ?? []);
-      })
-      .catch(() => {});
+    let cancelled = false;
 
-    const es = createAuditEventSource(auditId);
-    esRef.current = es;
-
-    es.onmessage = (event) => {
+    (async () => {
+      let status: {
+        documents?: SessionDocumentRef[];
+        status?: string;
+        error?: string | null;
+      } | null = null;
       try {
-        const data: SSEEvent = JSON.parse(event.data);
-
-        switch (data.type) {
-          case "connected":
-            // Session connected, audit will begin
-            break;
-
-          case "reasoning_step": {
-            const step = data.step;
-            if (!step) break;
-
-            markAgentActive(step.agent);
-
-            // If this is a summary step, mark agent done
-            if (step.step_type === "summary") {
-              markAgentDone(step.agent);
-            }
-
-            setSteps((prev) => [...prev, step]);
-
-            // Extract findings from finding steps
-            if (step.step_type === "finding") {
-              // Findings come via report_ready, but we can preview from steps
-            }
-            break;
-          }
-
-          case "report_ready": {
-            // Fetch full report from API
-            getAuditReport(auditId)
-              .then((r) => {
-                setReport(r);
-                setFindings(r.findings);
-              })
-              .catch(console.error);
-            break;
-          }
-
-          case "complete": {
-            setIsRunning(false);
-            setIsComplete(true);
-            setAgentStatuses((prev) => {
-              const next = { ...prev };
-              AGENT_ORDER.forEach((a) => {
-                if (next[a] !== "pending") next[a] = "done";
-              });
-              return next;
-            });
-            es.close();
-            break;
-          }
-
-          case "error": {
-            setError(data.message || "An error occurred during audit");
-            setIsRunning(false);
-            es.close();
-            break;
-          }
-        }
-      } catch (e) {
-        console.error("Failed to parse SSE event:", e);
+        status = await getAuditStatus(id);
+      } catch {
+        status = null;
       }
-    };
+      if (cancelled) return;
+      setSessionDocuments(status?.documents ?? []);
 
-    es.onerror = () => {
-      setError("Connection to audit stream lost. Please try again.");
-      setIsRunning(false);
-      es.close();
-    };
+      if (status?.status === "completed") {
+        try {
+          const r = await getAuditReport(id);
+          if (cancelled) return;
+          setReport(r);
+          setFindings(r.findings);
+        } catch {
+          if (!cancelled) setError("Failed to load the completed audit report.");
+        }
+        if (cancelled) return;
+        setIsRunning(false);
+        setIsComplete(true);
+        setAgentStatuses((prev) => {
+          const next = { ...prev };
+          AGENT_ORDER.forEach((a) => {
+            next[a] = "done";
+          });
+          return next;
+        });
+        return;
+      }
+
+      if (status?.status === "failed") {
+        setError(status.error || "Audit failed.");
+        setIsRunning(false);
+        return;
+      }
+
+      startStream();
+    })();
+
+    function startStream() {
+      if (cancelled) return;
+      const es = createAuditEventSource(id);
+      esRef.current = es;
+      attachHandlers(es);
+    }
+
+    function attachHandlers(es: EventSource) {
+      es.onmessage = (event) => {
+        try {
+          const data: SSEEvent = JSON.parse(event.data);
+
+          switch (data.type) {
+            case "connected":
+              // Session connected, audit will begin
+              break;
+
+            case "reasoning_step": {
+              const step = data.step;
+              if (!step) break;
+
+              markAgentActive(step.agent);
+
+              // If this is a summary step, mark agent done
+              if (step.step_type === "summary") {
+                markAgentDone(step.agent);
+              }
+
+              setSteps((prev) => [...prev, step]);
+
+              // Extract findings from finding steps
+              if (step.step_type === "finding") {
+                // Findings come via report_ready, but we can preview from steps
+              }
+              break;
+            }
+
+            case "report_ready": {
+              // Fetch full report from API
+              getAuditReport(id)
+                .then((r) => {
+                  setReport(r);
+                  setFindings(r.findings);
+                })
+                .catch(console.error);
+              break;
+            }
+
+            case "complete": {
+              setIsRunning(false);
+              setIsComplete(true);
+              setAgentStatuses((prev) => {
+                const next = { ...prev };
+                AGENT_ORDER.forEach((a) => {
+                  if (next[a] !== "pending") next[a] = "done";
+                });
+                return next;
+              });
+              es.close();
+              break;
+            }
+
+            case "error": {
+              setError(data.message || "An error occurred during audit");
+              setIsRunning(false);
+              es.close();
+              break;
+            }
+          }
+        } catch (e) {
+          console.error("Failed to parse SSE event:", e);
+        }
+      };
+
+      es.onerror = () => {
+        setError("Connection to audit stream lost. Please try again.");
+        setIsRunning(false);
+        es.close();
+      };
+    }
 
     return () => {
-      es.close();
-      esRef.current = null;
+      cancelled = true;
+      if (esRef.current) {
+        esRef.current.close();
+        esRef.current = null;
+      }
     };
   }, [auditId, markAgentActive, markAgentDone]);
 

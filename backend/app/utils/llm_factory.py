@@ -25,6 +25,8 @@ def _get_google_llm(role: OpenRouterRole | None, temperature: float) -> BaseChat
         model=model,
         google_api_key=settings.google_api_key,
         temperature=temperature,
+        timeout=settings.llm_timeout_seconds,
+        max_retries=settings.llm_max_retries,
     )
 
 
@@ -69,6 +71,8 @@ def get_llm(
         openai_api_key=settings.openrouter_api_key,
         openai_api_base=settings.openrouter_base_url,
         temperature=temperature,
+        timeout=settings.llm_timeout_seconds,
+        max_retries=settings.llm_max_retries,
         extra_body=extra_body if extra_body else None,
         default_headers={
             "HTTP-Referer": "https://github.com/auditmind",

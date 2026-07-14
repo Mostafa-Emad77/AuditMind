@@ -14,7 +14,9 @@ from app.tools.web_search import search_web
 from app.utils.arabic_normalizer import extract_amounts
 from app.utils.money_parse import parse_monetary_amount, amounts_within_tiny_tolerance
 from app.services.vector_store import get_all_chunks_for_docs
+from app.services.redis_store import get_suppressed_signatures
 from app.utils.llm_factory import get_llm
+from app.utils.finding_signature import finding_signature
 from app.utils.text_amount_scan import amounts_from_text_scan
 from app.config import get_settings
 
@@ -649,6 +651,17 @@ async def cross_checker_agent(state: AuditState) -> dict:
     _candidates_total = 0
     _accepted_total = 0
 
+    # False-positive feedback loop: signatures dismissed by reviewers on prior runs
+    # are suppressed here (transparently — we emit a reasoning step when we skip one).
+    try:
+        suppressed_signatures = await get_suppressed_signatures(state.get("api_key", "default"))
+    except Exception as e:
+        logger.warning("Could not load suppressed signatures (non-fatal): %s", e)
+        suppressed_signatures = set()
+
+    def _is_suppressed(f: Finding) -> bool:
+        return bool(suppressed_signatures) and finding_signature(f) in suppressed_signatures
+
     step = _emit(writer, "thought",
                  f"Starting cross-document analysis. "
                  f"I have {len(checklist)} checks to perform across {len(documents)} document(s). "
@@ -741,6 +754,12 @@ async def cross_checker_agent(state: AuditState) -> dict:
                     accepted, rejection_reason = _accept_finding(
                         candidate, source="graph", **_gate_kwargs
                     )
+                    if accepted and _is_suppressed(candidate):
+                        step = _emit(writer, "thought",
+                                     f"Skipping finding suppressed by prior reviewer feedback: "
+                                     f"{raw1} vs {raw2}")
+                        new_steps.append(step)
+                        continue
                     if accepted:
                         _accepted_total += 1
                         step = _emit(writer, "finding",
@@ -837,6 +856,12 @@ async def cross_checker_agent(state: AuditState) -> dict:
                     accepted, rejection_reason = _accept_finding(
                         lf, source="llm", **_gate_kwargs
                     )
+                    if accepted and _is_suppressed(lf):
+                        step = _emit(writer, "thought",
+                                     f"Skipping finding suppressed by prior reviewer feedback: "
+                                     f"{lf.title[:80]}")
+                        new_steps.append(step)
+                        continue
                     if accepted:
                         _accepted_total += 1
                         accepted_here += 1
@@ -873,6 +898,12 @@ async def cross_checker_agent(state: AuditState) -> dict:
                     accepted, rejection_reason = _accept_finding(
                         lf, source="llm", **_gate_kwargs
                     )
+                    if accepted and _is_suppressed(lf):
+                        step = _emit(writer, "thought",
+                                     f"Skipping finding suppressed by prior reviewer feedback: "
+                                     f"{lf.title[:80]}")
+                        new_steps.append(step)
+                        continue
                     if accepted:
                         _accepted_total += 1
                         accepted_here += 1

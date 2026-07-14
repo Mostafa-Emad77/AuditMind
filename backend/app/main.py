@@ -10,28 +10,42 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import AsyncIterator
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+import fitz  # PyMuPDF
+from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from app.config import get_settings
+from app.dependencies import require_api_key
 from app.models.schemas import (
     AuditReport,
     AuditSession,
+    ChatRequest,
     GraphData,
+    TriageRecord,
+    TriageRequest,
     UploadResponse,
 )
 from app.services.document_processor import ingest_document
 from app.services.graph_builder import close_driver, get_entity_graph, init_graph_schema
 from app.services.redis_store import (
+    add_suppressed_signature,
+    append_chat_messages,
     close_redis,
     find_document,
+    get_chat_history,
     get_redis,
     get_report,
     get_session,
+    get_triage,
+    is_heartbeat_alive,
+    remove_suppressed_signature,
     save_report,
     save_session,
+    set_triage,
+    touch_heartbeat,
 )
+from app.utils.finding_signature import finding_signature
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
@@ -45,6 +59,11 @@ _executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("AuditMind API starting up...")
+    if not get_settings().api_keys_list:
+        logger.warning(
+            "API_KEYS is not set — all /api/* routes are unauthenticated. "
+            "Set API_KEYS (comma-separated) to enable access control."
+        )
     # Warm up Redis connection so first request is fast
     try:
         await get_redis()
@@ -80,6 +99,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# All /api/* routes require a valid API key when API_KEYS is configured; /health stays open.
+api_router = APIRouter(prefix="/api", dependencies=[Depends(require_api_key)])
+
 
 # ─── Health ───────────────────────────────────────────────────────────────────
 
@@ -102,10 +124,11 @@ async def health():
 
 # ─── Document Upload ──────────────────────────────────────────────────────────
 
-@app.post("/api/upload", response_model=UploadResponse)
+@api_router.post("/upload", response_model=UploadResponse)
 async def upload_documents(
     files: list[UploadFile] = File(...),
     report_language: str = Query(default="english", regex="^(arabic|english)$"),
+    api_key: str = Depends(require_api_key),
 ):
     """
     Upload one or more PDF documents to start an audit session.
@@ -114,7 +137,14 @@ async def upload_documents(
     if not files:
         raise HTTPException(status_code=400, detail="At least one file is required.")
 
+    if len(files) > settings.max_upload_files:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Too many files: {len(files)} uploaded, max is {settings.max_upload_files}.",
+        )
+
     audit_id = str(uuid.uuid4())
+    max_bytes = settings.max_upload_file_size_mb * 1024 * 1024
 
     # Read file bytes while we're still in the async context
     file_payloads: list[tuple[str, bytes]] = []
@@ -127,6 +157,30 @@ async def upload_documents(
         content = await file.read()
         if len(content) == 0:
             raise HTTPException(status_code=400, detail=f"File '{file.filename}' is empty.")
+        if len(content) > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File '{file.filename}' exceeds the {settings.max_upload_file_size_mb} MB limit.",
+            )
+        if not content.startswith(b"%PDF-"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"File '{file.filename}' is not a valid PDF (bad file signature).",
+            )
+        try:
+            probe = fitz.open(stream=content, filetype="pdf")
+            page_count = len(probe)
+            probe.close()
+        except Exception:
+            raise HTTPException(
+                status_code=422,
+                detail=f"File '{file.filename}' could not be parsed as a PDF.",
+            )
+        if page_count > settings.max_upload_pages:
+            raise HTTPException(
+                status_code=422,
+                detail=f"File '{file.filename}' has {page_count} pages, max is {settings.max_upload_pages}.",
+            )
         file_payloads.append((file.filename, content))
 
     # Run CPU-heavy ingestion (OCR + embedding) concurrently in the thread pool.
@@ -153,6 +207,7 @@ async def upload_documents(
         documents=document_metas,
         status="pending",
         report_language=report_language,
+        api_key=api_key,
     )
     await save_session(session)
 
@@ -165,7 +220,7 @@ async def upload_documents(
 
 # ─── Audit Streaming ──────────────────────────────────────────────────────────
 
-@app.get("/api/audit/{audit_id}/stream")
+@api_router.get("/audit/{audit_id}/stream")
 async def stream_audit(audit_id: str):
     """
     Start the audit and stream agent reasoning steps as Server-Sent Events.
@@ -188,14 +243,20 @@ async def stream_audit(audit_id: str):
         )
 
     if session.status == "processing":
-        raise HTTPException(
-            status_code=409,
-            detail="Audit is already running. Connect to the existing stream or wait for it to complete.",
+        if await is_heartbeat_alive(audit_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Audit is already running. Connect to the existing stream or wait for it to complete.",
+            )
+        logger.warning(
+            "Recovering stale 'processing' session %s (heartbeat expired) — restarting.",
+            audit_id,
         )
 
     # Mark as processing and persist immediately
     session.status = "processing"
     await save_session(session)
+    await touch_heartbeat(audit_id)
 
     async def event_generator() -> AsyncIterator[str]:
         from app.agents.graph import audit_graph
@@ -218,6 +279,7 @@ async def stream_audit(audit_id: str):
             "report_language": current_session.report_language,
             "extraction_complete": False,
             "error": None,
+            "api_key": current_session.api_key,
         }
 
         yield f"data: {json.dumps({'type': 'connected', 'audit_id': audit_id, 'document_count': len(current_session.documents)})}\n\n"
@@ -227,6 +289,7 @@ async def stream_audit(audit_id: str):
                 initial_state,
                 stream_mode=["custom", "updates"],
             ):
+                await touch_heartbeat(audit_id)
                 if isinstance(event, tuple):
                     mode, data = event
                     if mode == "custom":
@@ -269,7 +332,7 @@ async def stream_audit(audit_id: str):
 
 # ─── Report Retrieval ─────────────────────────────────────────────────────────
 
-@app.get("/api/audit/{audit_id}/report")
+@api_router.get("/audit/{audit_id}/report")
 async def get_audit_report(audit_id: str):
     """Retrieve the completed audit report."""
     report = await get_report(audit_id)
@@ -286,9 +349,107 @@ async def get_audit_report(audit_id: str):
     return report.model_dump(mode="json")
 
 
+# ─── Conversational Q&A ───────────────────────────────────────────────────────
+
+@api_router.get("/audit/{audit_id}/chat")
+async def get_chat(audit_id: str):
+    """Return the stored chat history for an audit (for rehydrating the UI)."""
+    session = await get_session(audit_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Audit session not found.")
+    return {"audit_id": audit_id, "messages": await get_chat_history(audit_id)}
+
+
+@api_router.post("/audit/{audit_id}/chat")
+async def chat_with_audit(audit_id: str, body: ChatRequest):
+    """
+    Ask a question about the audited documents. Streams a retrieval-grounded answer
+    as Server-Sent Events: `sources` (retrieved passages), `delta` (answer chunks),
+    `done`, or `error`.
+    """
+    session = await get_session(audit_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Audit session not found.")
+
+    message = (body.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="A non-empty message is required.")
+
+    report = await get_report(audit_id)  # may be None if the audit hasn't finished
+    history = await get_chat_history(audit_id)
+
+    async def event_generator() -> AsyncIterator[str]:
+        from app.agents.qa_agent import answer_audit_question
+
+        try:
+            async for evt in answer_audit_question(
+                audit_id=audit_id,
+                session=session,
+                report=report,
+                message=message,
+                history=history,
+            ):
+                yield f"data: {json.dumps(evt, ensure_ascii=False, default=str)}\n\n"
+        except Exception as e:
+            logger.error("Chat stream error for %s: %s", audit_id, e)
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ─── Finding triage ───────────────────────────────────────────────────────────
+
+@api_router.get("/audit/{audit_id}/triage")
+async def get_audit_triage(audit_id: str):
+    """Return the triage map (finding_id → record) for an audit."""
+    session = await get_session(audit_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Audit session not found.")
+    return {"audit_id": audit_id, "triage": await get_triage(audit_id)}
+
+
+@api_router.post("/audit/{audit_id}/findings/{finding_id}/triage")
+async def triage_finding(audit_id: str, finding_id: str, body: TriageRequest):
+    """
+    Record a reviewer's verdict on a finding (accepted / dismissed / false_positive).
+
+    Marking a finding as a false positive stores its signature in a set scoped to the
+    audit's API key so the cross-checker can suppress matching findings on future runs
+    by that same caller. Changing the verdict away from false_positive lifts that
+    suppression.
+    """
+    session = await get_session(audit_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Audit session not found.")
+
+    report = await get_report(audit_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="No report found for this audit.")
+
+    finding = next((f for f in report.findings if f.finding_id == finding_id), None)
+    if not finding:
+        raise HTTPException(status_code=404, detail="Finding not found in this audit's report.")
+
+    signature = finding_signature(finding)
+    record = TriageRecord(status=body.status, note=body.note, signature=signature)
+    triage_map = await set_triage(audit_id, finding_id, record.model_dump(mode="json"))
+
+    if body.status == "false_positive":
+        await add_suppressed_signature(session.api_key, signature)
+    else:
+        # Reviewer changed their mind — stop suppressing this signature.
+        await remove_suppressed_signature(session.api_key, signature)
+
+    return {"audit_id": audit_id, "finding_id": finding_id, "triage": triage_map[finding_id]}
+
+
 # ─── Knowledge Graph ──────────────────────────────────────────────────────────
 
-@app.get("/api/audit/{audit_id}/graph", response_model=GraphData)
+@api_router.get("/audit/{audit_id}/graph", response_model=GraphData)
 async def get_graph(
     audit_id: str,
     center_node: str | None = Query(default=None),
@@ -317,7 +478,7 @@ async def get_graph(
 
 # ─── Session Status ───────────────────────────────────────────────────────────
 
-@app.get("/api/audit/{audit_id}/status")
+@api_router.get("/audit/{audit_id}/status")
 async def get_status(audit_id: str):
     """Get the current status of an audit session."""
     session = await get_session(audit_id)
@@ -333,15 +494,19 @@ async def get_status(audit_id: str):
         ],
         "created_at": session.created_at.isoformat(),
         "completed_at": session.completed_at.isoformat() if session.completed_at else None,
+        "error": session.error,
     }
 
 
 # ─── Document Details ─────────────────────────────────────────────────────────
 
-@app.get("/api/documents/{doc_id}")
+@api_router.get("/documents/{doc_id}")
 async def get_document(doc_id: str):
     """Retrieve metadata for a specific document."""
     doc = await find_document(doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
     return doc.model_dump()
+
+
+app.include_router(api_router)

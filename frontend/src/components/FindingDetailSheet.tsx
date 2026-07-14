@@ -2,7 +2,7 @@
 
 import * as Dialog from "@radix-ui/react-dialog";
 import { cn } from "@/lib/utils";
-import type { Finding } from "@/types";
+import type { Finding, TriageStatus } from "@/types";
 
 /** Parse "filename, page N: snippet" style evidence lines. */
 export function parseEvidenceLine(line: string): {
@@ -37,16 +37,44 @@ const SEVERITY_BADGE: Record<string, string> = {
   ok: "bg-emerald-50 text-emerald-700 border-emerald-200",
 };
 
+const TRIAGE_OPTIONS = [
+  {
+    status: "accepted" as const,
+    label: "Accept",
+    icon: "check_circle",
+    active: "bg-emerald-600 text-white border-emerald-600",
+    idle: "text-emerald-700 border-emerald-200 hover:bg-emerald-50",
+  },
+  {
+    status: "dismissed" as const,
+    label: "Dismiss",
+    icon: "do_not_disturb_on",
+    active: "bg-slate-600 text-white border-slate-600",
+    idle: "text-slate-700 border-outline-variant hover:bg-secondary",
+  },
+  {
+    status: "false_positive" as const,
+    label: "False positive",
+    icon: "flag",
+    active: "bg-red-600 text-white border-red-600",
+    idle: "text-red-700 border-red-200 hover:bg-red-50",
+  },
+];
+
 export function FindingDetailSheet({
   finding,
   open,
   onOpenChange,
   docFilenameById,
+  triageStatus,
+  onTriage,
 }: {
   finding: Finding | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   docFilenameById: Record<string, string>;
+  triageStatus?: TriageStatus | null;
+  onTriage?: (status: TriageStatus) => void;
 }) {
   if (!finding) return null;
 
@@ -212,6 +240,36 @@ export function FindingDetailSheet({
                       Flag as Material
                     </button>
                   </div>
+                )}
+              </div>
+            )}
+
+            {/* Reviewer verdict (triage) */}
+            {onTriage && (
+              <div className="border-t border-outline-variant pt-4">
+                <p className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground mb-2">
+                  Reviewer Verdict
+                </p>
+                <div className="flex gap-2">
+                  {TRIAGE_OPTIONS.map(({ status, label, icon, active, idle }) => (
+                    <button
+                      key={status}
+                      type="button"
+                      onClick={() => onTriage(status)}
+                      className={cn(
+                        "flex-1 flex items-center justify-center gap-1.5 py-2 px-2 text-[11px] font-semibold border rounded transition-colors",
+                        triageStatus === status ? active : idle
+                      )}
+                    >
+                      <span className="material-symbols-outlined text-[14px]">{icon}</span>
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {triageStatus === "false_positive" && (
+                  <p className="text-[10px] text-muted-foreground mt-2">
+                    This pattern will be suppressed in future audit runs.
+                  </p>
                 )}
               </div>
             )}

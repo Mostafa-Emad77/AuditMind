@@ -116,6 +116,8 @@ class AuditSession(BaseModel):
     completed_at: Optional[datetime] = None
     report_language: Literal["arabic", "english"] = "english"
     error: Optional[str] = None
+    # Scope for the suppressed-findings feedback loop; "default" when API-key auth is disabled.
+    api_key: str = "default"
 
 
 class ReconciliationSnapshot(BaseModel):
@@ -161,6 +163,25 @@ class AuditReport(BaseModel):
 class UploadResponse(BaseModel):
     audit_id: str
     documents: list[DocumentMeta]
+    message: str
+
+
+TriageStatus = Literal["accepted", "dismissed", "false_positive"]
+
+
+class TriageRequest(BaseModel):
+    status: TriageStatus
+    note: Optional[str] = None
+
+
+class TriageRecord(BaseModel):
+    status: TriageStatus
+    note: Optional[str] = None
+    signature: Optional[str] = None
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class ChatRequest(BaseModel):
     message: str
 
 

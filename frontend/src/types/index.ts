@@ -78,6 +78,34 @@ export interface AuditReport {
   entity_conflicts?: EntityConflictRow[];
 }
 
+// ─── Finding Triage ──────────────────────────────────────────────────────────
+
+export type TriageStatus = "accepted" | "dismissed" | "false_positive";
+
+export interface TriageRecord {
+  status: TriageStatus;
+  note?: string | null;
+  signature?: string | null;
+  updated_at: string;
+}
+
+export type TriageMap = Record<string, TriageRecord>;
+
+// ─── Conversational Q&A ──────────────────────────────────────────────────────
+
+export interface ChatSource {
+  doc_id: string;
+  doc_name: string;
+  page: number;
+  text: string;
+}
+
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+  sources?: ChatSource[];
+}
+
 // ─── Reasoning Trace ─────────────────────────────────────────────────────────
 
 export type AgentName = "extraction" | "planner" | "cross_checker" | "report_writer";

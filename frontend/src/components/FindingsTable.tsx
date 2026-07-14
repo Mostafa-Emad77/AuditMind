@@ -4,7 +4,13 @@ import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { CheckCircle2 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { Finding, Severity } from "@/types";
+import type { Finding, Severity, TriageMap, TriageStatus } from "@/types";
+
+const TRIAGE_CHIP: Record<TriageStatus, { label: string; cls: string }> = {
+  accepted: { label: "Accepted", cls: "bg-emerald-50 text-emerald-700 border-emerald-200" },
+  dismissed: { label: "Dismissed", cls: "bg-slate-100 text-slate-600 border-outline-variant" },
+  false_positive: { label: "False positive", cls: "bg-red-50 text-red-700 border-red-200" },
+};
 
 /* ── severity helpers ── */
 const SEVERITY_BADGE: Record<Severity, string> = {
@@ -30,10 +36,12 @@ interface FindingRowProps {
   finding: Finding;
   index: number;
   onOpenDetail?: (f: Finding) => void;
+  triageStatus?: TriageStatus;
 }
 
-function FindingRow({ finding, index, onOpenDetail }: FindingRowProps) {
+function FindingRow({ finding, index, onOpenDetail, triageStatus }: FindingRowProps) {
   const [isExpanded, setIsExpanded] = useState(finding.severity === "critical");
+  const isMuted = triageStatus === "dismissed" || triageStatus === "false_positive";
 
   return (
     <motion.tr
@@ -42,7 +50,8 @@ function FindingRow({ finding, index, onOpenDetail }: FindingRowProps) {
       transition={{ duration: 0.2, delay: index * 0.04 }}
       className={cn(
         "border-b border-outline-variant hover:bg-secondary transition-colors cursor-pointer",
-        isExpanded && SEVERITY_ROW_SELECTED[finding.severity]
+        isExpanded && SEVERITY_ROW_SELECTED[finding.severity],
+        isMuted && "opacity-55"
       )}
     >
       {/* Expand / detail in a nested structure */}
@@ -64,7 +73,17 @@ function FindingRow({ finding, index, onOpenDetail }: FindingRowProps) {
           </div>
           {/* Description */}
           <div className="flex-1 py-2 px-4 text-[13px] text-foreground font-medium min-w-0">
-            {finding.title}
+            <span className={cn(isMuted && "line-through")}>{finding.title}</span>
+            {triageStatus && (
+              <span
+                className={cn(
+                  "ml-2 inline-flex items-center px-1.5 py-0.5 rounded border text-[10px] font-semibold align-middle",
+                  TRIAGE_CHIP[triageStatus].cls
+                )}
+              >
+                {TRIAGE_CHIP[triageStatus].label}
+              </span>
+            )}
           </div>
           {/* Confidence */}
           <div className="py-2 px-4 w-[100px] text-right font-mono text-[13px] font-medium text-primary tabular-nums shrink-0">
@@ -152,9 +171,10 @@ interface FindingsTableProps {
   findings: Finding[];
   isLoading?: boolean;
   onOpenDetail?: (finding: Finding) => void;
+  triage?: TriageMap;
 }
 
-export function FindingsTable({ findings, isLoading, onOpenDetail }: FindingsTableProps) {
+export function FindingsTable({ findings, isLoading, onOpenDetail, triage }: FindingsTableProps) {
   const [filter, setFilter] = useState<Severity | "all">("all");
 
   const critical = findings.filter((f) => f.severity === "critical");
@@ -228,6 +248,7 @@ export function FindingsTable({ findings, isLoading, onOpenDetail }: FindingsTab
                 finding={finding}
                 index={i}
                 onOpenDetail={onOpenDetail}
+                triageStatus={triage?.[finding.finding_id]?.status}
               />
             ))}
           </tbody>

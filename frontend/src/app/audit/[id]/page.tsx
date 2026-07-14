@@ -1,7 +1,7 @@
 "use client";
 
 import Image from "next/image";
-import { use, useMemo, useState } from "react";
+import { use, useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import { AlertCircle, AlertTriangle, FileText, Loader2 } from "lucide-react";
@@ -11,15 +11,18 @@ import { FindingsTable } from "@/components/FindingsTable";
 import { AuditReport } from "@/components/AuditReport";
 import { ReconciliationPanel } from "@/components/ReconciliationPanel";
 import { FindingDetailSheet } from "@/components/FindingDetailSheet";
+import { ChatPanel } from "@/components/ChatPanel";
+import { getTriage, triageFinding } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import type { Finding } from "@/types";
+import type { Finding, TriageMap, TriageStatus } from "@/types";
 
-type TabId = "findings" | "reconciliation" | "report";
+type TabId = "findings" | "reconciliation" | "report" | "ask";
 
 const TABS: { id: TabId; label: string }[] = [
   { id: "findings", label: "Findings" },
   { id: "reconciliation", label: "Reconciliation" },
   { id: "report", label: "Report Preview" },
+  { id: "ask", label: "Ask AI" },
 ];
 
 export default function AuditPage({ params }: { params: Promise<{ id: string }> }) {
@@ -27,9 +30,34 @@ export default function AuditPage({ params }: { params: Promise<{ id: string }> 
   const router = useRouter();
   const [activeTab, setActiveTab] = useState<TabId>("findings");
   const [detailFinding, setDetailFinding] = useState<Finding | null>(null);
+  const [triage, setTriage] = useState<TriageMap>({});
 
   const { steps, findings, report, sessionDocuments, isRunning, isComplete, error, agentStatuses } =
     useAuditStream(auditId);
+
+  // Load reviewer triage verdicts once the audit (and its report) is available.
+  useEffect(() => {
+    if (!isComplete) return;
+    getTriage(auditId).then(setTriage).catch(() => {});
+  }, [auditId, isComplete]);
+
+  const handleTriage = useCallback(
+    async (findingId: string, status: TriageStatus) => {
+      // optimistic update
+      setTriage((prev) => ({
+        ...prev,
+        [findingId]: { ...prev[findingId], status, updated_at: new Date().toISOString() },
+      }));
+      try {
+        const record = await triageFinding(auditId, findingId, status);
+        setTriage((prev) => ({ ...prev, [findingId]: record }));
+      } catch {
+        // revert on failure by re-fetching authoritative state
+        getTriage(auditId).then(setTriage).catch(() => {});
+      }
+    },
+    [auditId]
+  );
 
   const docFilenameById = useMemo(
     () => Object.fromEntries(sessionDocuments.map((d) => [d.doc_id, d.filename])),
@@ -262,6 +290,7 @@ export default function AuditPage({ params }: { params: Promise<{ id: string }> 
                   findings={findings}
                   isLoading={isRunning && findings.length === 0}
                   onOpenDetail={(f) => setDetailFinding(f)}
+                  triage={triage}
                 />
               </motion.div>
             )}
@@ -294,6 +323,12 @@ export default function AuditPage({ params }: { params: Promise<{ id: string }> 
                 )}
               </motion.div>
             )}
+
+            {activeTab === "ask" && (
+              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} key="ask">
+                <ChatPanel auditId={auditId} disabled={!isComplete} />
+              </motion.div>
+            )}
           </div>
         </main>
       </div>
@@ -303,6 +338,8 @@ export default function AuditPage({ params }: { params: Promise<{ id: string }> 
         open={detailFinding !== null}
         onOpenChange={(open) => { if (!open) setDetailFinding(null); }}
         docFilenameById={docFilenameById}
+        triageStatus={detailFinding ? triage[detailFinding.finding_id]?.status ?? null : null}
+        onTriage={detailFinding ? (status) => handleTriage(detailFinding.finding_id, status) : undefined}
       />
 
       {/* Material Symbols */}

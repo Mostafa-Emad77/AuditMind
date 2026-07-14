@@ -13,7 +13,7 @@ from app.models.schemas import (
 )
 from app.services.graph_builder import find_contradictions, get_driver
 from app.utils.money_parse import parse_monetary_amount
-from app.utils.text_amount_scan import amounts_from_text_scan
+from app.utils.arabic_normalizer import extract_amounts
 
 logger = logging.getLogger(__name__)
 
@@ -145,78 +145,87 @@ def _aggregate_snapshot(rows: list[dict], documents: list[DocumentMeta]) -> Reco
     )
 
 
-def _strip_dominant_outliers(unique_desc: list[float]) -> list[float]:
-    """Remove one huge spike so fallback does not treat duplicated graph totals as 'bank'."""
-    s = list(unique_desc)
-    while len(s) >= 2 and s[0] > 15 * s[1]:
-        s = s[1:]
-    return s
+# Role keywords used to attach a loose amount in finding prose to a reconciliation
+# field. We pick the keyword occurring CLOSEST before the amount (not by rank), so
+# "bank paid 226,700 vs contract 200,000" maps each number to the right field.
+_ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "contract_total": ("contract", "agreement", "عقد", "اتفاق"),
+    "invoice_total": ("invoice", "billed", "فاتور"),
+    "bank_paid_total": (
+        "bank paid", "total paid", "bank", "paid", "transfer",
+        "disburse", "remitt", "دفع", "سداد", "تحويل",
+    ),
+}
+_LABEL_WINDOW = 50  # chars before an amount to search for a role keyword
 
 
-def _fallback_snapshot_from_findings(findings: list[Finding]) -> Optional[ReconciliationSnapshot]:
-    """Extract plausible headline numbers from finding text when graph data is thin."""
-    text = " ".join(
-        f.title + " " + f.description for f in findings if f.severity == "critical"
-    )
-    nums = amounts_from_text_scan(text, min_value=_MIN_HEADLINE)
-    if len(nums) < 2:
-        return None
-    nums_sorted = _strip_dominant_outliers(sorted(set(nums), reverse=True))
-    if len(nums_sorted) < 2:
-        return None
-    # Heuristic: largest = bank or contract mix; often 226700, 200000, 176700 in demo
-    bank_guess = nums_sorted[0] if nums_sorted else None
-    contract_guess = next((n for n in nums_sorted if n < bank_guess), None) if bank_guess else None
-    invoice_guess = next((n for n in nums_sorted if n not in (bank_guess, contract_guess)), None)
-    if bank_guess and contract_guess and bank_guess > contract_guess:
-        return ReconciliationSnapshot(
-            currency="EGP",
-            contract_total=contract_guess,
-            invoice_total=invoice_guess if invoice_guess and invoice_guess < bank_guess else None,
-            bank_paid_total=bank_guess,
-            variance_vs_contract=round(bank_guess - contract_guess, 2),
-            notes="Partially inferred from finding text (graph data incomplete).",
-        )
-    return None
+def _role_for_window(window: str) -> Optional[str]:
+    """Return the role whose keyword sits closest to the end of `window` (nearest the amount)."""
+    w = window.lower()
+    best_role: Optional[str] = None
+    best_pos = -1
+    for role, keywords in _ROLE_KEYWORDS.items():
+        for kw in keywords:
+            idx = w.rfind(kw)
+            if idx > best_pos:
+                best_pos = idx
+                best_role = role
+    return best_role
 
 
-def _should_override_bank_with_findings(
+def _label_grounded_amounts(findings: list[Finding]) -> dict[str, float]:
+    """
+    Map reconciliation fields → amount using only LABEL-GROUNDED evidence from
+    critical findings. An amount is assigned to a field only when a role keyword
+    appears just before it in the text; amounts with no nearby label are ignored
+    (no positional / sort-order guessing). Returns the largest amount per field.
+    """
+    out: dict[str, float] = {}
+    for f in findings:
+        if f.severity != "critical":
+            continue
+        text = f"{f.title}. {f.description or ''}"
+        for am in extract_amounts(text):
+            val = am.get("value")
+            pos = int(am.get("position", 0) or 0)
+            if val is None or val < _MIN_HEADLINE:
+                continue
+            role = _role_for_window(text[max(0, pos - _LABEL_WINDOW):pos])
+            if role is None:
+                continue
+            if role not in out or val > out[role]:
+                out[role] = float(val)
+    return out
+
+
+def _fill_snapshot_gaps(
     snapshot: ReconciliationSnapshot,
-    fb: Optional[ReconciliationSnapshot],
-) -> bool:
-    if fb is None or fb.bank_paid_total is None:
-        return False
-    ct = snapshot.contract_total
-    bp = snapshot.bank_paid_total
-    if ct is None or bp is None:
-        return False
-    if ct >= 2_000_000:
-        return False
-    if bp <= max(ct * 8, 500_000):
-        return False
-    return fb.bank_paid_total < bp * 0.5
-
-
-def _merge_bank_from_fallback(
-    snapshot: ReconciliationSnapshot,
-    fb: ReconciliationSnapshot,
+    inferred: dict[str, float],
 ) -> ReconciliationSnapshot:
-    extra = "Bank total adjusted using critical finding amounts (graph sum implausible)."
-    parts = [p for p in (snapshot.notes, fb.notes, extra) if p]
-    notes = " ".join(parts).strip()
-    ct = snapshot.contract_total
-    bank = fb.bank_paid_total
-    var: Optional[float] = None
-    if ct is not None and bank is not None:
-        var = round(bank - ct, 2)
-    return ReconciliationSnapshot(
-        currency=snapshot.currency,
-        contract_total=snapshot.contract_total,
-        invoice_total=snapshot.invoice_total,
-        bank_paid_total=round(bank, 2) if bank is not None else None,
-        variance_vs_contract=var,
-        notes=notes or None,
-    )
+    """
+    Fill ONLY the empty fields of a structured snapshot with label-grounded
+    inferences. Structured (role-tagged) values are authoritative and are never
+    overwritten. Variance is recomputed when both sides become known.
+    """
+    fields = ("contract_total", "invoice_total", "bank_paid_total")
+    filled: dict[str, float] = {
+        field: inferred[field]
+        for field in fields
+        if getattr(snapshot, field) is None and field in inferred
+    }
+    if not filled:
+        return snapshot
+
+    update: dict = dict(filled)
+    ct = filled.get("contract_total", snapshot.contract_total)
+    bp = filled.get("bank_paid_total", snapshot.bank_paid_total)
+    if ct is not None and bp is not None:
+        update["variance_vs_contract"] = round(bp - ct, 2)
+
+    label = ", ".join(field.replace("_total", "").replace("_", " ") for field in filled)
+    note = f"Inferred from labeled finding text: {label}."
+    update["notes"] = " ".join(p for p in (snapshot.notes, note) if p)
+    return snapshot.model_copy(update=update)
 
 
 def _contradictions_to_rows(contradictions: list[dict]) -> list[EntityConflictRow]:
@@ -285,12 +294,11 @@ def build_reconciliation_payload(
     doc_ids = [d.doc_id for d in documents]
     amount_rows = _fetch_amount_rows(doc_ids)
     snapshot = _aggregate_snapshot(amount_rows, documents)
-    fb = _fallback_snapshot_from_findings(findings) if findings else None
 
-    if not _snapshot_has_numbers(snapshot) and fb:
-        snapshot = fb
-    elif fb and _should_override_bank_with_findings(snapshot, fb):
-        snapshot = _merge_bank_from_fallback(snapshot, fb)
+    # Gap-fill only the fields the structured path left empty, using label-grounded
+    # amounts from critical findings. Structured values are never overwritten.
+    inferred = _label_grounded_amounts(findings) if findings else {}
+    snapshot = _fill_snapshot_gaps(snapshot, inferred)
 
     if not _snapshot_has_numbers(snapshot):
         snapshot = None

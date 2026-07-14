@@ -3,8 +3,12 @@ Redis-backed session and report store.
 Replaces the in-memory _sessions / _reports dicts in main.py.
 
 Keys used:
-  session:{audit_id}  → JSON-serialized AuditSession   (TTL: 7 days)
-  report:{audit_id}   → JSON-serialized AuditReport    (TTL: 7 days)
+  session:{audit_id}          → JSON-serialized AuditSession   (TTL: 7 days)
+  report:{audit_id}           → JSON-serialized AuditReport    (TTL: 7 days)
+  chat:{audit_id}              → JSON list of {role, content}   (TTL: 7 days)
+  triage:{audit_id}           → JSON map finding_id → record   (TTL: 7 days)
+  heartbeat:{audit_id}        → "1"                             (TTL: 2 min — liveness signal)
+  suppressed:{scope}:signatures → Set of finding signatures    (no TTL — per-API-key feedback)
 """
 import json
 import logging
@@ -90,6 +94,106 @@ async def get_report(audit_id: str) -> Optional[AuditReport]:
     if raw is None:
         return None
     return AuditReport.model_validate_json(raw)
+
+
+# ─── Chat history helpers ─────────────────────────────────────────────────────
+
+_CHAT_MAX_MESSAGES = 20  # keep the last N turns for context
+
+
+async def get_chat_history(audit_id: str) -> list[dict]:
+    """Return the stored chat history (list of {"role", "content"}) for an audit."""
+    r = await get_redis()
+    raw = await r.get(f"chat:{audit_id}")
+    if not raw:
+        return []
+    try:
+        history = json.loads(raw)
+        return history if isinstance(history, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
+async def append_chat_messages(audit_id: str, messages: list[dict]) -> None:
+    """Append messages to the audit's chat history, trimming to the last N."""
+    history = await get_chat_history(audit_id)
+    history.extend(messages)
+    history = history[-_CHAT_MAX_MESSAGES:]
+    r = await get_redis()
+    await r.set(f"chat:{audit_id}", json.dumps(history, ensure_ascii=False), ex=_TTL_SECONDS)
+
+
+# ─── Finding triage helpers ───────────────────────────────────────────────────
+
+async def get_triage(audit_id: str) -> dict[str, dict]:
+    """Return the triage map (finding_id → {status, note, signature, updated_at})."""
+    r = await get_redis()
+    raw = await r.get(f"triage:{audit_id}")
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+async def set_triage(audit_id: str, finding_id: str, record: dict) -> dict[str, dict]:
+    """Upsert a single finding's triage record; returns the full updated map."""
+    triage = await get_triage(audit_id)
+    triage[finding_id] = record
+    r = await get_redis()
+    await r.set(f"triage:{audit_id}", json.dumps(triage, ensure_ascii=False), ex=_TTL_SECONDS)
+    return triage
+
+
+# ─── Suppressed-signature feedback loop ───────────────────────────────────────
+# Scoped per API key (``scope`` — "default" when auth is disabled) so one caller's
+# false-positive dismissals don't silently suppress another caller's findings.
+
+
+def _suppressed_key(scope: str) -> str:
+    return f"suppressed:{scope}:signatures"
+
+
+async def add_suppressed_signature(scope: str, signature: str) -> None:
+    """Record a finding signature dismissed as a false positive (no TTL)."""
+    if not signature:
+        return
+    r = await get_redis()
+    await r.sadd(_suppressed_key(scope), signature)
+
+
+async def remove_suppressed_signature(scope: str, signature: str) -> None:
+    """Undo a suppression (e.g. when a finding's triage status changes back)."""
+    if not signature:
+        return
+    r = await get_redis()
+    await r.srem(_suppressed_key(scope), signature)
+
+
+async def get_suppressed_signatures(scope: str) -> set[str]:
+    """Return the set of suppressed finding signatures for a scope."""
+    r = await get_redis()
+    members = await r.smembers(_suppressed_key(scope))
+    return set(members) if members else set()
+
+
+# ─── Audit heartbeat (liveness signal for stale-session recovery) ────────────
+
+_HEARTBEAT_TTL_SECONDS = 120
+
+
+async def touch_heartbeat(audit_id: str) -> None:
+    """Refresh the self-expiring liveness key for a running audit."""
+    r = await get_redis()
+    await r.set(f"heartbeat:{audit_id}", "1", ex=_HEARTBEAT_TTL_SECONDS)
+
+
+async def is_heartbeat_alive(audit_id: str) -> bool:
+    """True if the audit's pipeline touched its heartbeat within the last TTL window."""
+    r = await get_redis()
+    return bool(await r.exists(f"heartbeat:{audit_id}"))
 
 
 # ─── Document lookup helper ───────────────────────────────────────────────────

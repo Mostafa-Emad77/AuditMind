@@ -43,3 +43,6 @@ class AuditState(TypedDict):
 
     # Error tracking
     error: Optional[str]
+
+    # Scope for the suppressed-findings feedback loop (see AuditSession.api_key)
+    api_key: str

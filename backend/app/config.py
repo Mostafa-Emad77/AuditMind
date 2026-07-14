@@ -120,6 +120,35 @@ class Settings(BaseSettings):
         description="Minimum confidence score for graph-sourced findings to be accepted",
     )
 
+    # Upload limits
+    max_upload_file_size_mb: int = Field(
+        default=20, description="Max size (MB) for a single uploaded PDF"
+    )
+    max_upload_files: int = Field(
+        default=10, description="Max number of files accepted in a single upload request"
+    )
+    max_upload_pages: int = Field(
+        default=50, description="Max page count for a single uploaded PDF"
+    )
+
+    # LLM reliability
+    llm_timeout_seconds: float = Field(
+        default=60.0, description="Per-request timeout for LLM calls"
+    )
+    llm_max_retries: int = Field(
+        default=2, description="Max automatic retries on transient LLM call failures"
+    )
+
+    # Auth
+    api_keys: str = Field(
+        default="",
+        description="Comma-separated list of valid API keys for /api/* routes. Empty = auth disabled.",
+    )
+
+    @property
+    def api_keys_list(self) -> list[str]:
+        return [k.strip() for k in self.api_keys.split(",") if k.strip()]
+
     # App
     app_env: str = Field(default="development")
     cors_origins: str = Field(default="http://localhost:3000")
