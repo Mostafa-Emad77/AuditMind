@@ -25,7 +25,7 @@ pymupdf==1.25.2
 Pillow==11.1.0
 # arabicOcr doesn't publish wheels for Python 3.12+; keep it optional.
 # The code already falls back to pytesseract when arabicOcr isn't available.
-arabicOcr==1.1.6; python_version < "3.12"
+# arabicOcr==1.1.6; python_version < "3.12"
 # Better multilingual OCR (Arabic + English), used before arabicOcr/tesseract.
 easyocr
 
