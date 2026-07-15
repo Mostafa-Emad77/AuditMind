@@ -10,8 +10,8 @@ This ``__init__`` re-exports the public entry point plus the pure helper
 functions that are unit-tested directly (see ``tests/test_cross_checker_regression.py``),
 so ``from app.agents.cross_checker import ...`` keeps working unchanged.
 """
-from app.agents.cross_checker.agent import (
-    cross_checker_agent,
+from app.agents.cross_checker.agent import cross_checker_agent
+from app.agents.cross_checker.evidence import (
     _emit,
     _evidence_line_backs_value,
     _evidence_snippets_back_values,

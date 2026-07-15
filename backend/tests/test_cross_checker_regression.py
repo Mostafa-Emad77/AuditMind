@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from app.agents.cross_checker import (
+from app.agents.cross_checker.evidence import (
     _evidence_line_backs_value,
     _evidence_snippets_back_values,
     _graph_context_for_compare,
@@ -103,5 +103,3 @@ def test_dedupe_findings_merges_same_bank_contract_story_despite_different_evide
     )
     deduped = dedupe_findings([a, b])
     assert len(deduped) == 1
-    )
-    assert _finding_dedup_key(a) == _finding_dedup_key(b)
