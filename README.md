@@ -222,6 +222,4 @@ Frontend API base URL: `NEXT_PUBLIC_API_URL` in `frontend/.env.local` (defaults 
 
 ---
 
-## One-line pitch (resume / portfolio)
 
-> Bilingual agentic financial auditor: LangGraph + OpenRouter/Gemini, hybrid RAG (Qdrant + Neo4j), EasyOCR for Arabic/English PDFs, FastAPI SSE, Next.js reasoning UI with reconciliation panel and conversational Q&A.
