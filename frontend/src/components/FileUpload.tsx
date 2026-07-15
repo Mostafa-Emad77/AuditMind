@@ -19,6 +19,7 @@ export function FileUpload({ onUploadComplete }: FileUploadProps) {
   const [isUploading, setIsUploading] = useState(false);
   const [reportLanguage, setReportLanguage] = useState<"english" | "arabic">("english");
   const [error, setError] = useState<string | null>(null);
+  const [partialUpload, setPartialUpload] = useState<UploadResponse | null>(null);
 
   const onDrop = useCallback(
     <T extends File>(accepted: T[], rejected: FileRejection[], _event: DropEvent) => {
@@ -52,9 +53,14 @@ export function FileUpload({ onUploadComplete }: FileUploadProps) {
     if (files.length === 0) return;
     setIsUploading(true);
     setError(null);
+    setPartialUpload(null);
     try {
       const response = await uploadDocuments(files, reportLanguage);
-      onUploadComplete(response);
+      if (response.failed.length > 0) {
+        setPartialUpload(response);
+      } else {
+        onUploadComplete(response);
+      }
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Upload failed. Please try again.");
     } finally {
@@ -158,6 +164,32 @@ export function FileUpload({ onUploadComplete }: FileUploadProps) {
         <div className="flex items-start gap-2 p-3 rounded-lg bg-red-50 border border-red-200 text-red-700 text-sm">
           <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
           {error}
+        </div>
+      )}
+
+      {/* Partial upload failure — some files processed, some didn't */}
+      {partialUpload && (
+        <div className="space-y-2 p-3 rounded-lg bg-amber-50 border border-amber-200 text-amber-800 text-sm">
+          <div className="flex items-start gap-2">
+            <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
+            <p>
+              {partialUpload.documents.length} of {files.length} file(s) processed successfully.{" "}
+              {partialUpload.failed.length} failed and will be excluded from the audit:
+            </p>
+          </div>
+          <ul className="pl-6 list-disc space-y-0.5">
+            {partialUpload.failed.map((f) => (
+              <li key={f.filename}>
+                <span className="font-semibold">{f.filename}</span>: {f.error}
+              </li>
+            ))}
+          </ul>
+          <button
+            onClick={() => onUploadComplete(partialUpload)}
+            className="mt-1 bg-amber-800 text-white text-xs font-medium px-3 py-1.5 rounded-md hover:opacity-90 transition-opacity"
+          >
+            Continue with {partialUpload.documents.length} document{partialUpload.documents.length > 1 ? "s" : ""}
+          </button>
         </div>
       )}
 

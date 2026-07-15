@@ -17,6 +17,7 @@ from app.utils.arabic_normalizer import (
     is_arabic_text,
 )
 from app.utils.llm_factory import get_llm
+from app.utils.llm_json import extract_json_obj as _extract_json_obj, normalize_llm_content
 from app.services.vector_store import store_chunks
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,6 @@ _CHUNK_SIZE = 800
 _CHUNK_OVERLAP = 150
 
 _DOC_TYPES = {"invoice", "contract", "balance_sheet", "bank_statement", "audit_report", "unknown"}
-_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
 def _is_scanned_page(page_text: str) -> bool:
@@ -106,22 +106,6 @@ def _classify_document_type(text: str, filename: str) -> str:
     return _classify_document_type_heuristic(text, filename)
 
 
-def _extract_json_obj(text: str) -> dict | None:
-    try:
-        parsed = json.loads(text)
-        return parsed if isinstance(parsed, dict) else None
-    except Exception:
-        pass
-    m = _JSON_BLOCK_RE.search(text or "")
-    if not m:
-        return None
-    try:
-        parsed = json.loads(m.group(0))
-        return parsed if isinstance(parsed, dict) else None
-    except Exception:
-        return None
-
-
 def _classify_document_type_llm(text: str, filename: str) -> str | None:
     sample = (text or "").strip()
     if not sample:
@@ -148,13 +132,8 @@ def _classify_document_type_llm(text: str, filename: str) -> str | None:
     try:
         llm = get_llm(temperature=0.0)
         resp = llm.invoke(prompt)
-        content = resp.content if hasattr(resp, "content") else str(resp)
-        if isinstance(content, list):
-            content = "".join(
-                c.get("text", "") if isinstance(c, dict) else str(c)
-                for c in content
-            )
-        data = _extract_json_obj(str(content))
+        content = normalize_llm_content(resp)
+        data = _extract_json_obj(content)
         doc_type = str((data or {}).get("doc_type", "unknown")).strip().lower()
         if doc_type in _DOC_TYPES:
             return doc_type

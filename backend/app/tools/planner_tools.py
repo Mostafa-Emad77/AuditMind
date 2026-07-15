@@ -1,13 +1,12 @@
 """Tools for the Audit Planner Agent."""
 import json
 import logging
-import re
 from langchain_core.tools import tool
 from app.models.schemas import ChecklistItem
 from app.utils.llm_factory import get_llm
+from app.utils.llm_json import extract_json_obj as _extract_json_obj, normalize_llm_content
 
 logger = logging.getLogger(__name__)
-_JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
 _VALID_CHECK_TYPES = {
     "amount_match",
     "date_consistency",
@@ -18,22 +17,6 @@ _VALID_CHECK_TYPES = {
     "other",
 }
 _VALID_PRIORITIES = {"high", "medium", "low"}
-
-
-def _extract_json_obj(text: str) -> dict | None:
-    try:
-        parsed = json.loads(text)
-        return parsed if isinstance(parsed, dict) else None
-    except Exception:
-        pass
-    m = _JSON_OBJ_RE.search(text or "")
-    if not m:
-        return None
-    try:
-        parsed = json.loads(m.group(0))
-        return parsed if isinstance(parsed, dict) else None
-    except Exception:
-        return None
 
 
 def _generate_checklist_deterministic(doc_types: list[str], doc_ids: list[str]) -> list[dict]:
@@ -229,13 +212,8 @@ def _generate_checklist_llm(doc_types: list[str], doc_ids: list[str]) -> list[di
         f"doc_ids: {json.dumps(doc_ids)}\n"
     )
     resp = llm.invoke(prompt)
-    content = resp.content if hasattr(resp, "content") else str(resp)
-    if isinstance(content, list):
-        content = "".join(
-            c.get("text", "") if isinstance(c, dict) else str(c)
-            for c in content
-        )
-    data = _extract_json_obj(str(content)) or {}
+    content = normalize_llm_content(resp)
+    data = _extract_json_obj(content) or {}
     raw_items = data.get("checklist", [])
     if not isinstance(raw_items, list):
         return []
@@ -297,63 +275,4 @@ def generate_checklist(doc_types_json: str, doc_ids_json: str) -> str:
         "checklist": checklist_items,
         "total_items": len(checklist_items),
         "doc_types_analyzed": list(set(doc_types)),
-    })
-
-
-@tool
-def get_audit_metadata(audit_id: str) -> str:
-    """
-    Retrieve the full metadata for an audit session including all document details.
-
-    Args:
-        audit_id: The audit session ID
-
-    Returns:
-        JSON string with all document metadata for the audit session
-    """
-    # Resolved at runtime — the planner accesses state directly
-    return json.dumps({
-        "audit_id": audit_id,
-        "note": "Metadata resolved from audit state",
-    })
-
-
-@tool
-def get_flagged_items(audit_id: str) -> str:
-    """
-    Retrieve all findings flagged by the Cross-Checker agent for this audit.
-
-    Args:
-        audit_id: The audit session ID
-
-    Returns:
-        JSON string with all flagged findings including severity and evidence
-    """
-    # Resolved at runtime from audit state
-    return json.dumps({
-        "audit_id": audit_id,
-        "note": "Findings resolved from audit state",
-    })
-
-
-@tool
-def cite_source(doc_id: str, page_num: int, excerpt: str) -> str:
-    """
-    Create a formatted source citation linking a finding back to its origin.
-
-    Args:
-        doc_id: The source document ID
-        page_num: The page number where the finding was detected
-        excerpt: The relevant text excerpt from the source
-
-    Returns:
-        JSON string with a formatted citation
-    """
-    return json.dumps({
-        "citation": {
-            "doc_id": doc_id,
-            "page": page_num,
-            "excerpt": excerpt[:300],
-            "formatted": f"[Document {doc_id[:8]}..., Page {page_num}]: {excerpt[:150]}...",
-        }
     })

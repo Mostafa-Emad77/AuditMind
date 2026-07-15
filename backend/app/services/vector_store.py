@@ -297,3 +297,18 @@ def delete_doc_chunks(doc_id: str) -> None:
             must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
         ),
     )
+
+
+def delete_docs_chunks(doc_ids: list[str]) -> None:
+    """Remove all chunks belonging to any of the given documents in one request."""
+    if not doc_ids:
+        return
+    settings = get_settings()
+    client = get_qdrant_client()
+    client.delete(
+        collection_name=settings.qdrant_collection,
+        points_selector=Filter(
+            should=[FieldCondition(key="doc_id", match=MatchValue(value=did)) for did in doc_ids]
+        ),
+    )
+    logger.info("Deleted Qdrant chunks for %d doc(s)", len(doc_ids))

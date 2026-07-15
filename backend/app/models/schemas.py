@@ -11,7 +11,6 @@ class DocumentMeta(BaseModel):
     language: Literal["arabic", "english", "mixed", "unknown"] = "unknown"
     page_count: int = 0
     upload_time: datetime = Field(default_factory=datetime.utcnow)
-    parties: list[str] = Field(default_factory=list)
     dates_found: list[str] = Field(default_factory=list)
     amounts_found: list[str] = Field(default_factory=list)
     ocr_used: bool = False
@@ -160,10 +159,16 @@ class AuditReport(BaseModel):
 
 # ─── API Request / Response schemas ─────────────────────────────────────────
 
+class UploadFileError(BaseModel):
+    filename: str
+    error: str
+
+
 class UploadResponse(BaseModel):
     audit_id: str
     documents: list[DocumentMeta]
     message: str
+    failed: list[UploadFileError] = Field(default_factory=list)
 
 
 TriageStatus = Literal["accepted", "dismissed", "false_positive"]

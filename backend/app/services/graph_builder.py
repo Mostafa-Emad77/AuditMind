@@ -69,6 +69,43 @@ def init_graph_schema() -> None:
     _run_with_reconnect(_run)
 
 
+def delete_audit_documents(doc_ids: list[str]) -> None:
+    """
+    Remove Document nodes for an audit and prune entities that no longer belong
+    to any remaining document.
+
+    Only the FOUND_IN edges for the given docs are deleted (not the entities
+    themselves), because global-dedupe entity types (company, contract_id, ...)
+    can be shared across multiple audits' documents via canonical IDs. An entity
+    is only DETACH DELETEd once it has no remaining FOUND_IN edge to any document.
+    """
+    if not doc_ids:
+        return
+    settings = get_settings()
+
+    def _run(driver: Driver):
+        with driver.session(database=settings.neo4j_database) as session:
+            session.run(
+                """
+                UNWIND $doc_ids AS did
+                MATCH (d:Document {doc_id: did})
+                OPTIONAL MATCH (e:Entity)-[r:FOUND_IN]->(d)
+                DELETE r
+                WITH collect(DISTINCT e) AS candidates, collect(DISTINCT d) AS docs
+                FOREACH (d IN docs | DETACH DELETE d)
+                WITH candidates
+                UNWIND candidates AS e
+                WITH DISTINCT e
+                WHERE e IS NOT NULL AND NOT (e)-[:FOUND_IN]->()
+                DETACH DELETE e
+                """,
+                doc_ids=doc_ids,
+            )
+        logger.info("Deleted Neo4j Document nodes and orphaned entities for %d doc(s)", len(doc_ids))
+
+    _run_with_reconnect(_run)
+
+
 def store_document_node(meta: DocumentMeta) -> None:
     """Create or update a Document node in Neo4j."""
     settings = get_settings()

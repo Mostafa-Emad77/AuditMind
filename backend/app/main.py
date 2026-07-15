@@ -24,21 +24,27 @@ from app.models.schemas import (
     GraphData,
     TriageRecord,
     TriageRequest,
+    UploadFileError,
     UploadResponse,
 )
 from app.services.document_processor import ingest_document
-from app.services.graph_builder import close_driver, get_entity_graph, init_graph_schema
+from app.services.graph_builder import close_driver, delete_audit_documents, get_entity_graph, init_graph_schema
+from app.services.vector_store import delete_docs_chunks
 from app.services.redis_store import (
     add_suppressed_signature,
+    append_audit_event,
     append_chat_messages,
+    clear_audit_events,
     close_redis,
     find_document,
+    get_audit_events,
     get_chat_history,
     get_redis,
     get_report,
     get_session,
     get_triage,
     is_heartbeat_alive,
+    purge_audit,
     remove_suppressed_signature,
     save_report,
     save_session,
@@ -54,6 +60,13 @@ logger = logging.getLogger(__name__)
 # OCR is the bottleneck on multi-doc uploads; size to the core count so concurrent
 # ingestion (asyncio.gather below) actually utilizes the machine.
 _executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
+
+# In-process registry of running audit pipeline tasks, keyed by audit_id.
+# The pipeline itself runs as a free-standing asyncio.Task (not tied to any SSE
+# connection), so a client disconnecting from /stream no longer cancels the audit.
+# This dict only prevents duplicate task creation within a single process/worker;
+# cross-process/restart staleness is handled by the heartbeat TTL (see below).
+_running_audits: dict[str, asyncio.Task] = {}
 
 
 @asynccontextmanager
@@ -192,15 +205,21 @@ async def upload_documents(
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     document_metas = []
+    failed_files: list[UploadFileError] = []
     for (filename, _content), result in zip(file_payloads, results):
         if isinstance(result, Exception):
             logger.error("Failed to ingest '%s': %s", filename, result)
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to process '{filename}': {str(result)}",
-            )
+            failed_files.append(UploadFileError(filename=filename, error=str(result)))
+            continue
         document_metas.append(result)
         logger.info("Ingested document '%s' for audit %s", filename, audit_id)
+
+    if not document_metas:
+        raise HTTPException(
+            status_code=422,
+            detail=f"All {len(failed_files)} file(s) failed to process: "
+            + "; ".join(f"{f.filename} ({f.error})" for f in failed_files),
+        )
 
     session = AuditSession(
         audit_id=audit_id,
@@ -211,19 +230,132 @@ async def upload_documents(
     )
     await save_session(session)
 
+    message = f"Successfully uploaded {len(document_metas)} document(s). Ready to audit."
+    if failed_files:
+        message += f" {len(failed_files)} file(s) failed and were skipped."
+
     return UploadResponse(
         audit_id=audit_id,
         documents=document_metas,
-        message=f"Successfully uploaded {len(document_metas)} document(s). Ready to audit.",
+        message=message,
+        failed=failed_files,
     )
 
 
-# ─── Audit Streaming ──────────────────────────────────────────────────────────
+# ─── Audit Execution (background task, decoupled from any SSE connection) ────
+
+async def _run_audit_pipeline(audit_id: str) -> None:
+    """
+    Run the full LangGraph audit pipeline to completion, persisting every SSE-shaped
+    event to Redis as it goes (see `append_audit_event`). This is a free-standing
+    asyncio.Task — it is NOT tied to any client connection, so a client closing its
+    `/stream` connection has no effect on the audit; it keeps running and can be
+    resumed by any later `/stream` subscriber.
+    """
+    from app.agents.graph import audit_graph
+    from app.models.state import AuditState
+
+    current_session = await get_session(audit_id)
+    if not current_session:
+        await append_audit_event(audit_id, {"type": "error", "audit_id": audit_id, "message": "Session expired"})
+        return
+
+    initial_state: AuditState = {
+        "messages": [],
+        "audit_id": audit_id,
+        "documents": current_session.documents,
+        "checklist": [],
+        "findings": [],
+        "report": None,
+        "reasoning_trace": [],
+        "report_language": current_session.report_language,
+        "extraction_complete": False,
+        "error": None,
+        "api_key": current_session.api_key,
+    }
+
+    await append_audit_event(
+        audit_id,
+        {"type": "connected", "audit_id": audit_id, "document_count": len(current_session.documents)},
+    )
+
+    try:
+        async for event in audit_graph.astream(initial_state, stream_mode=["custom", "updates"]):
+            await touch_heartbeat(audit_id)
+            if isinstance(event, tuple):
+                mode, data = event
+                if mode == "custom":
+                    await append_audit_event(audit_id, data)
+                elif mode == "updates":
+                    for _node_name, node_update in data.items():
+                        if node_update.get("report"):
+                            report: AuditReport = node_update["report"]
+                            await save_report(report)
+                            await append_audit_event(audit_id, {
+                                "type": "report_ready",
+                                "audit_id": audit_id,
+                                "overall_risk": report.overall_risk,
+                                "finding_count": len(report.findings),
+                            })
+
+        current_session.status = "completed"
+        current_session.completed_at = datetime.utcnow()
+        await save_session(current_session)
+        await append_audit_event(audit_id, {"type": "complete", "audit_id": audit_id, "status": "completed"})
+
+    except Exception as e:
+        logger.error("Audit pipeline error for %s: %s", audit_id, e)
+        current_session.status = "failed"
+        current_session.error = str(e)
+        await save_session(current_session)
+        await append_audit_event(audit_id, {"type": "error", "audit_id": audit_id, "message": str(e)})
+    finally:
+        _running_audits.pop(audit_id, None)
+
+
+async def _ensure_audit_running(audit_id: str, session: AuditSession) -> AuditSession:
+    """
+    Idempotently (re)start the background pipeline task for an audit.
+
+    - completed: no-op, caller should fetch the report.
+    - processing + alive heartbeat: already running (in this or another worker), no-op.
+    - processing + stale heartbeat, pending, or failed: (re)start from scratch.
+    """
+    if session.status == "completed":
+        return session
+
+    if session.status == "processing":
+        if await is_heartbeat_alive(audit_id) or audit_id in _running_audits:
+            return session
+        logger.warning("Recovering stale 'processing' session %s (heartbeat expired) — restarting.", audit_id)
+
+    await clear_audit_events(audit_id)
+    session.status = "processing"
+    session.error = None
+    await save_session(session)
+    await touch_heartbeat(audit_id)
+
+    task = asyncio.create_task(_run_audit_pipeline(audit_id))
+    _running_audits[audit_id] = task
+    return session
+
+
+@api_router.post("/audit/{audit_id}/start")
+async def start_audit(audit_id: str):
+    """Start (or resume) an audit's background pipeline. Idempotent — safe to call repeatedly."""
+    session = await get_session(audit_id)
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Audit session '{audit_id}' not found.")
+    session = await _ensure_audit_running(audit_id, session)
+    return {"audit_id": audit_id, "status": session.status}
+
 
 @api_router.get("/audit/{audit_id}/stream")
 async def stream_audit(audit_id: str):
     """
-    Start the audit and stream agent reasoning steps as Server-Sent Events.
+    Subscribe to an audit's Server-Sent Events. Starts the pipeline if it hasn't
+    been started yet; otherwise replays every event persisted so far and then tails
+    new ones as they're produced by the (independently running) background task.
 
     Event types:
     - connected       — session acknowledged
@@ -236,89 +368,33 @@ async def stream_audit(audit_id: str):
     if not session:
         raise HTTPException(status_code=404, detail=f"Audit session '{audit_id}' not found.")
 
-    if session.status == "completed":
-        raise HTTPException(
-            status_code=409,
-            detail="This audit session has already completed. Retrieve the report instead.",
-        )
-
-    if session.status == "processing":
-        if await is_heartbeat_alive(audit_id):
-            raise HTTPException(
-                status_code=409,
-                detail="Audit is already running. Connect to the existing stream or wait for it to complete.",
-            )
-        logger.warning(
-            "Recovering stale 'processing' session %s (heartbeat expired) — restarting.",
-            audit_id,
-        )
-
-    # Mark as processing and persist immediately
-    session.status = "processing"
-    await save_session(session)
-    await touch_heartbeat(audit_id)
+    session = await _ensure_audit_running(audit_id, session)
 
     async def event_generator() -> AsyncIterator[str]:
-        from app.agents.graph import audit_graph
-        from app.models.state import AuditState
-
-        # Re-fetch session inside generator to get latest state
-        current_session = await get_session(audit_id)
-        if not current_session:
-            yield f"data: {json.dumps({'type': 'error', 'audit_id': audit_id, 'message': 'Session expired'})}\n\n"
-            return
-
-        initial_state: AuditState = {
-            "messages": [],
-            "audit_id": audit_id,
-            "documents": current_session.documents,
-            "checklist": [],
-            "findings": [],
-            "report": None,
-            "reasoning_trace": [],
-            "report_language": current_session.report_language,
-            "extraction_complete": False,
-            "error": None,
-            "api_key": current_session.api_key,
-        }
-
-        yield f"data: {json.dumps({'type': 'connected', 'audit_id': audit_id, 'document_count': len(current_session.documents)})}\n\n"
-
-        try:
-            async for event in audit_graph.astream(
-                initial_state,
-                stream_mode=["custom", "updates"],
-            ):
-                await touch_heartbeat(audit_id)
-                if isinstance(event, tuple):
-                    mode, data = event
-                    if mode == "custom":
-                        yield f"data: {json.dumps(data, default=str)}\n\n"
-                    elif mode == "updates":
-                        for _node_name, node_update in data.items():
-                            if node_update.get("report"):
-                                report: AuditReport = node_update["report"]
-                                await save_report(report)
-                                yield f"data: {json.dumps({'type': 'report_ready', 'audit_id': audit_id, 'overall_risk': report.overall_risk, 'finding_count': len(report.findings)}, default=str)}\n\n"
-                elif isinstance(event, dict):
-                    if event.get("report"):
-                        report = event["report"]
-                        await save_report(report)
-                        yield f"data: {json.dumps({'type': 'report_ready', 'audit_id': audit_id, 'overall_risk': report.overall_risk, 'finding_count': len(report.findings)}, default=str)}\n\n"
-
-            # Mark completed and persist
-            current_session.status = "completed"
-            current_session.completed_at = datetime.utcnow()
-            await save_session(current_session)
-
-            yield f"data: {json.dumps({'type': 'complete', 'audit_id': audit_id, 'status': 'completed'})}\n\n"
-
-        except Exception as e:
-            logger.error("Audit stream error for %s: %s", audit_id, e)
-            current_session.status = "failed"
-            current_session.error = str(e)
-            await save_session(current_session)
-            yield f"data: {json.dumps({'type': 'error', 'audit_id': audit_id, 'message': str(e)})}\n\n"
+        next_index = 0
+        terminal_types = {"complete", "error"}
+        while True:
+            events = await get_audit_events(audit_id, start=next_index)
+            for event in events:
+                yield f"data: {json.dumps(event, default=str)}\n\n"
+                next_index += 1
+                if event.get("type") in terminal_types:
+                    return
+            if events:
+                continue
+            # No new events this pass — check if the run has finished without
+            # emitting an explicit terminal event (defensive; normally it does).
+            current = await get_session(audit_id)
+            if not current:
+                yield f"data: {json.dumps({'type': 'error', 'audit_id': audit_id, 'message': 'Session expired'})}\n\n"
+                return
+            if current.status == "completed":
+                yield f"data: {json.dumps({'type': 'complete', 'audit_id': audit_id, 'status': 'completed'})}\n\n"
+                return
+            if current.status == "failed":
+                yield f"data: {json.dumps({'type': 'error', 'audit_id': audit_id, 'message': current.error or 'Audit failed'})}\n\n"
+                return
+            await asyncio.sleep(0.4)
 
     return StreamingResponse(
         event_generator(),
@@ -334,17 +410,24 @@ async def stream_audit(audit_id: str):
 
 @api_router.get("/audit/{audit_id}/report")
 async def get_audit_report(audit_id: str):
-    """Retrieve the completed audit report."""
+    """Retrieve the completed audit report.
+
+    Returns 200 with `{"status": "processing"|"pending"|"failed", ...}` while the
+    audit hasn't finished yet — the audit is still processing, not an error
+    condition, so this intentionally avoids the anti-pattern of raising an
+    HTTPException with a 2xx status code.
+    """
     report = await get_report(audit_id)
     if not report:
         session = await get_session(audit_id)
         if not session:
             raise HTTPException(status_code=404, detail="Audit session not found.")
         if session.status != "completed":
-            raise HTTPException(
-                status_code=202,
-                detail=f"Audit is still {session.status}. Poll this endpoint or connect to the stream.",
-            )
+            return {
+                "audit_id": audit_id,
+                "status": session.status,
+                "message": f"Audit is still {session.status}. Poll this endpoint or connect to the stream.",
+            }
         raise HTTPException(status_code=404, detail="Report not found despite completed status.")
     return report.model_dump(mode="json")
 
@@ -474,6 +557,38 @@ async def get_graph(
     except Exception as e:
         logger.error("Failed to retrieve graph for audit %s: %s", audit_id, e)
         raise HTTPException(status_code=500, detail=f"Graph retrieval failed: {str(e)}")
+
+
+# ─── Audit Deletion (data lifecycle) ──────────────────────────────────────────
+
+@api_router.delete("/audit/{audit_id}")
+async def delete_audit(audit_id: str):
+    """
+    Permanently delete an audit: its Redis session/report/chat/triage/events, its
+    Qdrant document chunks, and its Neo4j Document nodes (orphaned Entity nodes are
+    pruned too — entities still referenced by other audits' documents are kept).
+    """
+    session = await get_session(audit_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Audit session not found.")
+
+    doc_ids = [d.doc_id for d in session.documents]
+    loop = asyncio.get_running_loop()
+
+    if doc_ids:
+        try:
+            await loop.run_in_executor(_executor, delete_docs_chunks, doc_ids)
+        except Exception as e:
+            logger.warning("Failed to delete Qdrant chunks for audit %s: %s", audit_id, e)
+        try:
+            await loop.run_in_executor(_executor, delete_audit_documents, doc_ids)
+        except Exception as e:
+            logger.warning("Failed to delete Neo4j data for audit %s: %s", audit_id, e)
+
+    await purge_audit(audit_id)
+    _running_audits.pop(audit_id, None)
+
+    return {"audit_id": audit_id, "deleted": True}
 
 
 # ─── Session Status ───────────────────────────────────────────────────────────

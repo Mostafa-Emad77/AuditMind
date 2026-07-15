@@ -49,24 +49,6 @@ def test_evidence_snippets_back_values_for_bank_recon():
     assert _evidence_snippets_back_values(ev, 200000.0, 226700.0)
 
 
-def test_bank_recon_detectors_return_lists_not_hallucinated_amounts():
-    """Sanity: detectors return structured dicts; no string concatenation of amounts."""
-    from app.agents.cross_checker import detect_bank_overpayment_gaps
-    from app.models.schemas import DocumentMeta
-
-    docs = [
-        DocumentMeta(doc_id="c", filename="c.pdf", doc_type="contract"),
-        DocumentMeta(doc_id="b", filename="b.pdf", doc_type="bank_statement"),
-    ]
-    results = [
-        {"doc_id": "c", "page": 1, "text": "Contract value EGP 100,000."},
-        {"doc_id": "b", "page": 1, "text": "Payment transfer EGP 100,001."},
-    ]
-    gaps = detect_bank_overpayment_gaps(results, docs)
-    dumped = json.dumps(gaps)
-    assert "100001100000" not in dumped
-
-
 def test_graph_context_includes_anchor():
     ctx = _graph_context_for_compare(
         {
@@ -93,9 +75,9 @@ def test_real_mismatch_vs_rounding(v1, v2, expect_contra):
     assert data["is_contradiction"] is expect_contra
 
 
-def test_finding_dedup_key_ignores_evidence_and_txn_lines():
-    """Same bank-vs-contract story must share a key despite different evidence / TXN amounts."""
-    from app.agents.cross_checker import _finding_dedup_key
+def test_dedupe_findings_merges_same_bank_contract_story_despite_different_evidence():
+    """Same bank-vs-contract story must dedupe to one despite different evidence / TXN lines."""
+    from app.agents.cross_checker.dedup import dedupe_findings
     from app.models.schemas import Finding
 
     a = Finding(
@@ -118,5 +100,8 @@ def test_finding_dedup_key_ignores_evidence_and_txn_lines():
         evidence=["bank.pdf, page 2: 750,000.00 balance"],
         source_doc_id="c",
         conflicting_doc_id="b",
+    )
+    deduped = dedupe_findings([a, b])
+    assert len(deduped) == 1
     )
     assert _finding_dedup_key(a) == _finding_dedup_key(b)

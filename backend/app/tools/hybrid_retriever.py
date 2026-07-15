@@ -9,6 +9,7 @@ from app.services.vector_store import semantic_search, keyword_search
 from app.services.graph_builder import query_graph_for_entities
 from app.utils.arabic_normalizer import extract_amounts
 from app.utils.llm_factory import get_llm
+from app.utils.llm_json import extract_json_obj as _extract_json_dict, normalize_llm_content
 
 # Identifier-like tokens (contract IDs, invoice numbers) that dense embeddings miss.
 # Examples matched: INV-2024-0837, C/MOH/2023/041, CON.21.A, 2024-INV-9
@@ -35,8 +36,6 @@ def _extract_id_like_tokens(query: str) -> list[str]:
             break
     return tokens
 
-_JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
-
 
 def _extract_query_entities(query: str) -> list[str]:
     """Extract graph-traversal entities using LLM, with safe regex fallback."""
@@ -56,13 +55,8 @@ def _extract_query_entities(query: str) -> list[str]:
     try:
         llm = get_llm(temperature=0.0)
         resp = llm.invoke(prompt)
-        content = resp.content if hasattr(resp, "content") else str(resp)
-        if isinstance(content, list):
-            content = "".join(
-                c.get("text", "") if isinstance(c, dict) else str(c)
-                for c in content
-            )
-        data = _extract_json_dict(str(content)) or {}
+        content = normalize_llm_content(resp)
+        data = _extract_json_dict(content) or {}
         ents = data.get("entities", [])
         if isinstance(ents, list):
             cleaned = []
@@ -92,22 +86,6 @@ def _extract_query_entities(query: str) -> list[str]:
     arabic_words = re.findall(r"[\u0600-\u06FF]{3,}", q)
     entities.extend(arabic_words[:5])
     return list(dict.fromkeys(entities))
-
-
-def _extract_json_dict(text: str) -> dict | None:
-    try:
-        parsed = json.loads(text)
-        return parsed if isinstance(parsed, dict) else None
-    except Exception:
-        pass
-    m = _JSON_OBJ_RE.search(text or "")
-    if not m:
-        return None
-    try:
-        parsed = json.loads(m.group(0))
-        return parsed if isinstance(parsed, dict) else None
-    except Exception:
-        return None
 
 
 # Relational signals that make graph traversal the better backend (rule-based, no LLM).

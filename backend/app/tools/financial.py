@@ -1,82 +1,13 @@
 """Financial analysis tools for the Cross-Checker agent."""
 import json
-import re
 from typing import Optional
 from langchain_core.tools import tool
-from app.services.vector_store import semantic_search
-from app.utils.arabic_normalizer import extract_amounts
 from app.utils.money_parse import parse_monetary_amount, amounts_within_tiny_tolerance
 
 
 def _parse_amount(value: str) -> Optional[float]:
     """Parse a monetary value string to float. Delegates to deterministic single-token parser."""
     return parse_monetary_amount(value)
-
-
-@tool
-def extract_financial_figures(doc_id: str, figure_type: str = "all") -> str:
-    """
-    Extract all financial figures (amounts, dates, parties) from a specific document.
-
-    Args:
-        doc_id: The document ID to extract from
-        figure_type: Type of figures to extract: "amounts", "dates", "parties", or "all"
-
-    Returns:
-        JSON string with all extracted financial figures from the document
-    """
-    # Query Qdrant for chunks from this document
-    results = semantic_search(
-        query="amount total sum payment contract value date party name",
-        doc_ids=[doc_id],
-        top_k=20,
-    )
-
-    figures: dict = {"amounts": [], "dates": [], "parties": [], "raw_passages": []}
-
-    # Patterns
-    date_pattern = re.compile(
-        r'\b(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2}|'
-        r'\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December|'
-        r'يناير|فبراير|مارس|أبريل|مايو|يونيو|يوليو|أغسطس|سبتمبر|أكتوبر|نوفمبر|ديسمبر)\s+\d{4})\b',
-        re.IGNORECASE | re.UNICODE
-    )
-
-    seen_amounts = set()
-    seen_dates = set()
-
-    for chunk in results:
-        text = chunk.get("text", "")
-        page = chunk.get("page_num", 0)
-
-        if figure_type in ("amounts", "all"):
-            for amt in extract_amounts(text):
-                key = amt["raw"]
-                if key not in seen_amounts:
-                    seen_amounts.add(key)
-                    parsed = _parse_amount(key)
-                    figures["amounts"].append({
-                        "raw": key,
-                        "parsed_value": parsed,
-                        "page": page,
-                        "doc_id": doc_id,
-                    })
-
-        if figure_type in ("dates", "all"):
-            for m in date_pattern.finditer(text):
-                date_str = m.group(0)
-                if date_str not in seen_dates:
-                    seen_dates.add(date_str)
-                    figures["dates"].append({"date": date_str, "page": page})
-
-        figures["raw_passages"].append({"page": page, "text": text[:300]})
-
-    return json.dumps({
-        "doc_id": doc_id,
-        "figures": figures,
-        "amount_count": len(figures["amounts"]),
-        "date_count": len(figures["dates"]),
-    })
 
 
 @tool

@@ -24,16 +24,8 @@ Structure the report as JSON with this exact schema:
   "title": "Audit Report - [Company/Document Set Name]",
   "executive_summary": "2-3 sentences summarizing overall audit outcome",
   "documents_reviewed": ["list of document filenames"],
-  "findings_narrative": [
-    {{
-      "finding_id": "...",
-      "section": "critical|warnings|observations",
-      "narrative": "Detailed description of the finding with citations"
-    }}
-  ],
   "recommendations": ["list of actionable recommendations"],
-  "overall_risk": "critical|high|medium|low|clean",
-  "conclusion": "1-2 sentences on next steps"
+  "overall_risk": "critical|high|medium|low|clean"
 }}"""),
     ("human", """Audit Session ID: {audit_id}
 Documents: {documents}
@@ -54,16 +46,8 @@ _REPORT_PROMPT_AR = ChatPromptTemplate.from_messages([
   "title": "تقرير المراجعة - [اسم الشركة/مجموعة المستندات]",
   "executive_summary": "2-3 جمل تلخص نتيجة المراجعة الإجمالية",
   "documents_reviewed": ["قائمة بأسماء المستندات"],
-  "findings_narrative": [
-    {{
-      "finding_id": "...",
-      "section": "critical|warnings|observations",
-      "narrative": "وصف تفصيلي للنتيجة مع الاستشهادات"
-    }}
-  ],
   "recommendations": ["قائمة من التوصيات القابلة للتنفيذ"],
-  "overall_risk": "critical|high|medium|low|clean",
-  "conclusion": "1-2 جملة حول الخطوات التالية"
+  "overall_risk": "critical|high|medium|low|clean"
 }}"""),
     ("human", """معرف جلسة المراجعة: {audit_id}
 المستندات: {documents}
@@ -112,12 +96,9 @@ async def report_writer_agent(state: AuditState) -> dict:
                  f"I have {len(findings)} finding(s) to incorporate.")
     new_steps.append(step)
 
-    # Cite sources
-    for finding in findings:
-        step = _emit(writer, "tool_call",
-                     f"Citing source for: {finding.title[:60]}...",
-                     tool_name="cite_source",
-                     tool_input={"doc_id": finding.source_doc_id, "page": finding.source_page})
+    if findings:
+        step = _emit(writer, "thought",
+                     f"Attaching source citations for {len(findings)} finding(s).")
         new_steps.append(step)
 
     # Count by severity

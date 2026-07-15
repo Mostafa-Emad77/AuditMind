@@ -7,6 +7,7 @@ Keys used:
   report:{audit_id}           → JSON-serialized AuditReport    (TTL: 7 days)
   chat:{audit_id}              → JSON list of {role, content}   (TTL: 7 days)
   triage:{audit_id}           → JSON map finding_id → record   (TTL: 7 days)
+  events:{audit_id}           → List of persisted SSE events   (TTL: 7 days)
   heartbeat:{audit_id}        → "1"                             (TTL: 2 min — liveness signal)
   suppressed:{scope}:signatures → Set of finding signatures    (no TTL — per-API-key feedback)
 """
@@ -75,6 +76,24 @@ async def get_session(audit_id: str) -> Optional[AuditSession]:
 async def delete_session(audit_id: str) -> None:
     r = await get_redis()
     await r.delete(f"session:{audit_id}")
+
+
+async def delete_report(audit_id: str) -> None:
+    r = await get_redis()
+    await r.delete(f"report:{audit_id}")
+
+
+async def purge_audit(audit_id: str) -> None:
+    """Delete all Redis keys associated with an audit (session, report, chat, triage, events, heartbeat)."""
+    r = await get_redis()
+    await r.delete(
+        f"session:{audit_id}",
+        f"report:{audit_id}",
+        f"chat:{audit_id}",
+        f"triage:{audit_id}",
+        f"events:{audit_id}",
+        f"heartbeat:{audit_id}",
+    )
 
 
 # ─── Report helpers ───────────────────────────────────────────────────────────
@@ -194,6 +213,38 @@ async def is_heartbeat_alive(audit_id: str) -> bool:
     """True if the audit's pipeline touched its heartbeat within the last TTL window."""
     r = await get_redis()
     return bool(await r.exists(f"heartbeat:{audit_id}"))
+
+
+# ─── Audit event log (background execution decoupled from the SSE connection) ─
+# The pipeline appends every SSE-shaped event (reasoning_step, report_ready, complete,
+# error) to a Redis list as it runs. The `/stream` endpoint is a pure read-only
+# subscriber: it replays this list from the beginning, then tails new entries as they
+# arrive — so a client disconnecting (tab close, network blip) no longer kills the
+# audit, and reconnecting resumes the trace instead of losing it.
+
+async def append_audit_event(audit_id: str, event: dict) -> None:
+    """Append one SSE-shaped event to the audit's persisted event log."""
+    r = await get_redis()
+    await r.rpush(f"events:{audit_id}", json.dumps(event, ensure_ascii=False, default=str))
+    await r.expire(f"events:{audit_id}", _TTL_SECONDS)
+
+
+async def get_audit_events(audit_id: str, start: int = 0) -> list[dict]:
+    """Return persisted events for an audit from index `start` onward."""
+    r = await get_redis()
+    raw = await r.lrange(f"events:{audit_id}", start, -1)
+    return [json.loads(item) for item in raw]
+
+
+async def get_audit_events_count(audit_id: str) -> int:
+    r = await get_redis()
+    return await r.llen(f"events:{audit_id}")
+
+
+async def clear_audit_events(audit_id: str) -> None:
+    """Drop a prior run's event log before restarting a stale/failed audit."""
+    r = await get_redis()
+    await r.delete(f"events:{audit_id}")
 
 
 # ─── Document lookup helper ───────────────────────────────────────────────────

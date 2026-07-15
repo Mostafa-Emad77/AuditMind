@@ -17,7 +17,6 @@ export interface DocumentMeta {
   language: Language;
   page_count: number;
   upload_time: string;
-  parties: string[];
   dates_found: string[];
   amounts_found: string[];
   ocr_used: boolean;
@@ -175,10 +174,16 @@ export interface GraphData {
 
 // ─── Upload ───────────────────────────────────────────────────────────────────
 
+export interface UploadFileError {
+  filename: string;
+  error: string;
+}
+
 export interface UploadResponse {
   audit_id: string;
   documents: DocumentMeta[];
   message: string;
+  failed: UploadFileError[];
 }
 
 // ─── Hook Return Types ────────────────────────────────────────────────────────
