@@ -15,6 +15,14 @@ function shortDocLabel(id: string, docFilenameById: Record<string, string>): str
   return docFilenameById[id] || `${id.slice(0, 8)}…`;
 }
 
+/** Quote a CSV field only when it contains characters that require it (RFC 4180). */
+function csvField(value: string): string {
+  if (/[",\n]/.test(value)) {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+  return value;
+}
+
 const CONFLICT_BADGE: Record<string, string> = {
   critical: "bg-red-50 text-red-700 border-red-200",
   warning: "bg-amber-50 text-amber-700 border-amber-200",
@@ -65,6 +73,27 @@ export function ReconciliationPanel({
       setSortKey(key);
       setSortDir("desc");
     }
+  };
+
+  const handleExportCsv = () => {
+    const header = ["Entity ID", "Doc A (Contract)", "Doc A Value", "Doc B (Invoice)", "Doc B Value", "Conflict Type"];
+    const lines = sortedRows.map((r) => [
+      r.entity_label,
+      shortDocLabel(r.doc_a_id, docFilenameById),
+      r.doc_a_value,
+      shortDocLabel(r.doc_b_id, docFilenameById),
+      r.doc_b_value,
+      r.severity,
+    ].map(csvField).join(","));
+    const csv = [header.map(csvField).join(","), ...lines].join("\n");
+
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `entity-conflicts-${(report?.audit_id ?? "audit").slice(0, 8)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const variance = snap?.variance_vs_contract;
@@ -154,16 +183,15 @@ export function ReconciliationPanel({
               Cross-document conflicts detected in the knowledge graph.
             </p>
           </div>
-          <div className="flex gap-2">
-            <button className="flex items-center gap-1.5 px-3 py-1.5 border border-outline-variant rounded text-xs font-semibold text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors">
-              <span className="material-symbols-outlined text-[14px]">upload</span>
-              Export
+          {sortedRows.length > 0 && (
+            <button
+              onClick={handleExportCsv}
+              className="flex items-center gap-1.5 px-3 py-1.5 border border-outline-variant rounded text-xs font-semibold text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors"
+            >
+              <span className="material-symbols-outlined text-[14px]">download</span>
+              Export CSV
             </button>
-            <button className="flex items-center gap-1.5 px-3 py-1.5 border border-outline-variant rounded text-xs font-semibold text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors">
-              <span className="material-symbols-outlined text-[14px]">picture_as_pdf</span>
-              Download PDF
-            </button>
-          </div>
+          )}
         </div>
 
         {sortedRows.length === 0 ? (

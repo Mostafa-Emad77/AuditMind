@@ -18,8 +18,10 @@ from fastapi.responses import StreamingResponse
 from app.config import get_settings
 from app.dependencies import require_api_key
 from app.models.schemas import (
+    AuditListResponse,
     AuditReport,
     AuditSession,
+    AuditSummary,
     ChatRequest,
     GraphData,
     TriageRecord,
@@ -29,7 +31,7 @@ from app.models.schemas import (
 )
 from app.services.document_processor import ingest_document
 from app.services.graph_builder import close_driver, delete_audit_documents, get_entity_graph, init_graph_schema
-from app.services.vector_store import delete_docs_chunks
+from app.services.vector_store import delete_docs_chunks, init_collection
 from app.services.redis_store import (
     add_suppressed_signature,
     append_audit_event,
@@ -44,6 +46,7 @@ from app.services.redis_store import (
     get_session,
     get_triage,
     is_heartbeat_alive,
+    list_sessions,
     purge_audit,
     remove_suppressed_signature,
     save_report,
@@ -89,6 +92,13 @@ async def lifespan(app: FastAPI):
         logger.info("Neo4j schema initialized.")
     except Exception as e:
         logger.warning("Neo4j schema init failed on startup (non-fatal): %s", e)
+    # Create the Qdrant collection + payload indexes once at boot (was re-run per document).
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, init_collection)
+        logger.info("Qdrant collection initialized.")
+    except Exception as e:
+        logger.warning("Qdrant collection init failed on startup (non-fatal): %s", e)
     yield
     logger.info("AuditMind API shutting down...")
     await close_redis()
@@ -589,6 +599,38 @@ async def delete_audit(audit_id: str):
     _running_audits.pop(audit_id, None)
 
     return {"audit_id": audit_id, "deleted": True}
+
+
+# ─── Audit Archive ─────────────────────────────────────────────────────────────
+
+@api_router.get("/audits", response_model=AuditListResponse)
+async def list_audits(api_key: str = Depends(require_api_key)):
+    """List past audits for the caller's scope, newest first — powers the Archive page."""
+    sessions = await list_sessions(api_key)
+    summaries: list[AuditSummary] = []
+    for session in sessions:
+        overall_risk = None
+        critical_count = 0
+        warning_count = 0
+        if session.status == "completed":
+            report = await get_report(session.audit_id)
+            if report:
+                overall_risk = report.overall_risk
+                critical_count = sum(1 for f in report.findings if f.severity == "critical")
+                warning_count = sum(1 for f in report.findings if f.severity == "warning")
+        summaries.append(AuditSummary(
+            audit_id=session.audit_id,
+            status=session.status,
+            document_count=len(session.documents),
+            filenames=[d.filename for d in session.documents],
+            created_at=session.created_at,
+            completed_at=session.completed_at,
+            error=session.error,
+            overall_risk=overall_risk,
+            critical_count=critical_count,
+            warning_count=warning_count,
+        ))
+    return AuditListResponse(audits=summaries)
 
 
 # ─── Session Status ───────────────────────────────────────────────────────────

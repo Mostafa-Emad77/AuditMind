@@ -249,6 +249,25 @@ async def clear_audit_events(audit_id: str) -> None:
 
 # ─── Document lookup helper ───────────────────────────────────────────────────
 
+async def list_sessions(api_key: str) -> list[AuditSession]:
+    """Return every session in one API-key scope, newest first — powers the Archive list.
+
+    Full SCAN, same acceptable-at-current-scale tradeoff as find_document() (see
+    roadmap D4) — revisit with a secondary index if audit volume grows.
+    """
+    r = await get_redis()
+    sessions: list[AuditSession] = []
+    async for key in r.scan_iter("session:*"):
+        raw = await r.get(key)
+        if not raw:
+            continue
+        session = AuditSession.model_validate_json(raw)
+        if session.api_key == api_key:
+            sessions.append(session)
+    sessions.sort(key=lambda s: s.created_at, reverse=True)
+    return sessions
+
+
 async def find_document(doc_id: str):
     """Scan all sessions to find a document by doc_id.
     Only used by the /documents/{doc_id} endpoint — not a hot path.

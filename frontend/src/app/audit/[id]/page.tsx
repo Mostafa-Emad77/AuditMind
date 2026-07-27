@@ -100,19 +100,12 @@ export default function AuditPage({ params }: { params: Promise<{ id: string }> 
             <Image src="/logo.png" alt="AuditMind Logo" width={28} height={28} className="object-contain" />
             AuditMind
           </button>
-          <nav className="hidden md:flex gap-1">
-            <a href="/" className="text-muted-foreground hover:text-foreground text-sm px-2 py-1 rounded hover:bg-secondary transition-colors">
-              Dashboard
-            </a>
-            <a href="#" className="text-primary border-b-2 border-primary text-sm font-semibold px-2 pb-0.5">
-              Workpapers
-            </a>
-            {["Analytics", "Archive"].map((l) => (
-              <a key={l} href="#" className="text-muted-foreground hover:text-foreground text-sm px-2 py-1 rounded hover:bg-secondary transition-colors">
-                {l}
-              </a>
-            ))}
-          </nav>
+          <button
+            onClick={() => router.push("/archive")}
+            className="text-sm font-medium text-muted-foreground hover:text-foreground transition-colors"
+          >
+            Archive
+          </button>
         </div>
         <div className="flex items-center gap-2">
           {criticalCount > 0 && (
@@ -139,14 +132,6 @@ export default function AuditPage({ params }: { params: Promise<{ id: string }> 
               Audit complete
             </span>
           )}
-          {["language", "settings", "notifications"].map((icon) => (
-            <button key={icon} className="p-2 hover:bg-secondary rounded-full transition-colors text-muted-foreground">
-              <span className="material-symbols-outlined text-[20px]">{icon}</span>
-            </button>
-          ))}
-          <div className="h-8 w-8 bg-muted rounded-full flex items-center justify-center border border-outline-variant">
-            <span className="material-symbols-outlined text-muted-foreground text-[18px]">person</span>
-          </div>
         </div>
       </header>
 

@@ -1,5 +1,6 @@
 import type {
   AuditReport,
+  AuditSummary,
   ChatMessage,
   ChatSource,
   TriageMap,
@@ -51,6 +52,13 @@ export async function getAuditReport(auditId: string): Promise<AuditReport> {
     throw new Error(err.detail || "Failed to fetch report");
   }
   return res.json();
+}
+
+export async function listAudits(): Promise<AuditSummary[]> {
+  const res = await fetch(`${API_BASE}/api/audits`, withAuth());
+  if (!res.ok) throw new Error("Failed to fetch audit history");
+  const data = await res.json().catch(() => ({ audits: [] }));
+  return (data.audits ?? []) as AuditSummary[];
 }
 
 export async function getAuditStatus(auditId: string) {

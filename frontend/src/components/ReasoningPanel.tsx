@@ -140,14 +140,6 @@ export function ReasoningPanel({ steps, agentStatuses, isRunning, isComplete }: 
 
         <div ref={bottomRef} />
       </nav>
-
-      {/* Footer */}
-      <div className="p-4 mt-auto">
-        <button className="w-full flex items-center justify-center gap-2 py-2 px-4 border border-outline-variant rounded text-xs font-semibold text-muted-foreground hover:bg-white hover:text-foreground transition-colors">
-          <span className="material-symbols-outlined text-[14px]">terminal</span>
-          View Live Logs
-        </button>
-      </div>
     </div>
   );
 }

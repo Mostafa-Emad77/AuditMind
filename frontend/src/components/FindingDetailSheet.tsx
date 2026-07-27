@@ -229,18 +229,6 @@ export function FindingDetailSheet({
                 >
                   {finding.recommendation}
                 </p>
-                {finding.severity === "critical" && (
-                  <div className="mt-3 flex gap-2">
-                    <button className="flex-1 flex items-center justify-center gap-1.5 py-2 px-3 text-[11px] font-semibold text-primary border border-primary rounded hover:bg-primary hover:text-white transition-colors">
-                      <span className="material-symbols-outlined text-[13px]">mail</span>
-                      Generate RFI Email
-                    </button>
-                    <button className="flex-1 flex items-center justify-center gap-1.5 py-2 px-3 text-[11px] font-semibold text-red-600 border border-red-200 bg-red-50 rounded hover:bg-red-100 transition-colors">
-                      <span className="material-symbols-outlined text-[13px]">flag</span>
-                      Flag as Material
-                    </button>
-                  </div>
-                )}
               </div>
             )}
 

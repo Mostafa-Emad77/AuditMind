@@ -90,7 +90,7 @@ export function FileUpload({ onUploadComplete }: FileUploadProps) {
               {isDragActive ? "Drop your files here..." : "Drag and drop your files here"}
             </p>
             <p className="text-sm text-muted-foreground mt-1">
-              Support for PDF, DOCX, and XLSX up to {MAX_SIZE_MB}MB per file.
+              Support for PDF up to {MAX_SIZE_MB}MB per file.
             </p>
           </div>
           <button

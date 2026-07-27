@@ -186,6 +186,21 @@ export interface UploadResponse {
   failed: UploadFileError[];
 }
 
+// ─── Audit Archive ────────────────────────────────────────────────────────────
+
+export interface AuditSummary {
+  audit_id: string;
+  status: AuditStatus;
+  document_count: number;
+  filenames: string[];
+  created_at: string;
+  completed_at?: string | null;
+  error?: string | null;
+  overall_risk?: OverallRisk | null;
+  critical_count: number;
+  warning_count: number;
+}
+
 // ─── Hook Return Types ────────────────────────────────────────────────────────
 
 export interface SessionDocumentRef {

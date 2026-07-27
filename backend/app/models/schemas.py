@@ -171,6 +171,25 @@ class UploadResponse(BaseModel):
     failed: list[UploadFileError] = Field(default_factory=list)
 
 
+class AuditSummary(BaseModel):
+    """Lightweight per-audit summary row for the Archive list."""
+
+    audit_id: str
+    status: Literal["pending", "processing", "completed", "failed"]
+    document_count: int
+    filenames: list[str]
+    created_at: datetime
+    completed_at: Optional[datetime] = None
+    error: Optional[str] = None
+    overall_risk: Optional[Literal["critical", "high", "medium", "low", "clean"]] = None
+    critical_count: int = 0
+    warning_count: int = 0
+
+
+class AuditListResponse(BaseModel):
+    audits: list[AuditSummary]
+
+
 TriageStatus = Literal["accepted", "dismissed", "false_positive"]
 
 
