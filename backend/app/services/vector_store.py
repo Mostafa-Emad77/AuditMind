@@ -24,6 +24,8 @@ from app.utils.canonical_id import canonical_chunk_point_id
 logger = logging.getLogger(__name__)
 
 _encoder: Optional[SentenceTransformer] = None
+_client: Optional[QdrantClient] = None
+_collection_ready: Optional[str] = None
 
 
 def get_encoder() -> SentenceTransformer:
@@ -35,14 +37,29 @@ def get_encoder() -> SentenceTransformer:
 
 
 def get_qdrant_client() -> QdrantClient:
-    settings = get_settings()
-    kwargs: dict = {"url": settings.qdrant_url, "timeout": 120}
-    if settings.qdrant_api_key:
-        kwargs["api_key"] = settings.qdrant_api_key
-    return QdrantClient(**kwargs)
+    """Process-wide singleton — one HTTP connection pool, same pattern as get_encoder()."""
+    global _client
+    if _client is None:
+        settings = get_settings()
+        kwargs: dict = {"url": settings.qdrant_url, "timeout": 120}
+        if settings.qdrant_api_key:
+            kwargs["api_key"] = settings.qdrant_api_key
+        _client = QdrantClient(**kwargs)
+    return _client
 
 
 def ensure_collection(client: QdrantClient, collection_name: str, vector_size: int = 768) -> None:
+    """
+    Create the collection and its payload indexes.
+
+    Idempotent but not free — 4 round-trips. `_collection_ready` makes repeat calls
+    a no-op so per-document ingestion doesn't pay for it; `init_collection()` runs it
+    once at startup.
+    """
+    global _collection_ready
+    if _collection_ready == collection_name:
+        return
+
     existing = [c.name for c in client.get_collections().collections]
     if collection_name not in existing:
         client.create_collection(
@@ -79,6 +96,18 @@ def ensure_collection(client: QdrantClient, collection_name: str, vector_size: i
     except Exception as exc:
         # Older Qdrant versions or unsupported tokenizer settings — non-fatal.
         logger.debug("Text payload index create skipped: %s", exc)
+
+    _collection_ready = collection_name
+
+
+def init_collection() -> None:
+    """Create the configured collection at startup, like the Neo4j schema init."""
+    settings = get_settings()
+    ensure_collection(
+        get_qdrant_client(),
+        settings.qdrant_collection,
+        get_encoder().get_sentence_embedding_dimension(),
+    )
 
 
 def store_chunks(chunks: list[DocumentChunk]) -> int:

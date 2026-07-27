@@ -97,13 +97,16 @@ def _ocr_page(page: fitz.Page) -> str:
 
 def _classify_document_type(text: str, filename: str) -> str:
     """
-    LLM-first document classification from content + filename.
-    Falls back to deterministic regex classifier if LLM fails.
+    Heuristic-first document classification from content + filename.
+
+    The regex classifier only commits above its confidence threshold, so a non-"unknown"
+    result is trustworthy — and free. The LLM call (seconds of perceived upload latency
+    per document) runs only when the heuristic can't decide.
     """
-    llm_type = _classify_document_type_llm(text, filename)
-    if llm_type:
-        return llm_type
-    return _classify_document_type_heuristic(text, filename)
+    heuristic_type = _classify_document_type_heuristic(text, filename)
+    if heuristic_type != "unknown":
+        return heuristic_type
+    return _classify_document_type_llm(text, filename) or "unknown"
 
 
 def _classify_document_type_llm(text: str, filename: str) -> str | None:

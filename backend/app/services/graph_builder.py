@@ -289,7 +289,12 @@ def find_contradictions(doc_ids: list[str]) -> list[dict]:
     Only pairs of amount entities that share a non-amount anchor (contract, invoice,
     party, etc.) via RELATES are considered — not arbitrary shortest-path neighbors.
 
-    Results include amount_role so callers can apply further semantic filtering.
+    Each unordered pair is returned once (the match is symmetric, so without the
+    entity_id ordering constraint every pair came back twice), ordered by relative
+    amount difference so the callers' top-N are the most material discrepancies.
+
+    Results include amount_role; incomparable role pairs are filtered out with
+    `_roles_are_comparable` before returning.
     Pairs where one entity is an opening/closing balance are excluded at query time.
     """
     settings = get_settings()
@@ -302,7 +307,8 @@ def find_contradictions(doc_ids: list[str]) -> list[dict]:
                 MATCH (e2:Entity)-[:FOUND_IN]->(d2:Document)
                 WHERE e1.entity_type = 'amount'
                   AND e2.entity_type = 'amount'
-                  AND e1.entity_id <> e2.entity_id
+                  // Unordered pairs: the match is symmetric, so keep one direction only.
+                  AND e1.entity_id < e2.entity_id
                   AND d1.doc_id <> d2.doc_id
                   AND d1.doc_id IN $doc_ids
                   AND d2.doc_id IN $doc_ids
@@ -349,13 +355,34 @@ def find_contradictions(doc_ids: list[str]) -> list[dict]:
                        d2.filename AS doc2_name,
                        e1.source_page AS page1,
                        e2.source_page AS page2
+                ORDER BY CASE
+                           WHEN e1.amount_value IS NULL OR e2.amount_value IS NULL THEN 0.0
+                           WHEN abs(e1.amount_value) + abs(e2.amount_value) = 0 THEN 0.0
+                           ELSE abs(e1.amount_value - e2.amount_value) /
+                                CASE
+                                  WHEN abs(e1.amount_value) > abs(e2.amount_value)
+                                    THEN abs(e1.amount_value)
+                                  ELSE abs(e2.amount_value)
+                                END
+                         END DESC
                 LIMIT 50
                 """,
                 doc_ids=doc_ids,
             )
             return [dict(r) for r in result]
 
-    return _run_with_reconnect(_run)
+    rows = _run_with_reconnect(_run)
+
+    # Apply the full role-compatibility matrix. The Cypher only excludes
+    # opening/closing balances; pairs like retainer vs total_contract_value would
+    # otherwise reach the LLM and burn an adjudication call each.
+    kept = [r for r in rows if _roles_are_comparable(r.get("role1"), r.get("role2"))]
+    if len(kept) < len(rows):
+        logger.info(
+            "find_contradictions: filtered %d/%d pair(s) with incomparable amount roles",
+            len(rows) - len(kept), len(rows),
+        )
+    return kept
 
 
 _GLOBAL_DEDUPE_TYPES = {"contract_id", "invoice_id", "company", "person"}

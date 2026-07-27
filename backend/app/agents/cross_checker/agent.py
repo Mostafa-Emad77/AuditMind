@@ -1,4 +1,5 @@
 """Cross-Checker Agent orchestration — the core contradiction detection engine."""
+import asyncio
 import json
 import logging
 
@@ -12,6 +13,7 @@ from app.tools.neo4j_tools import detect_graph_contradictions
 from app.services.vector_store import get_all_chunks_for_docs
 from app.services.redis_store import get_suppressed_signatures
 from app.utils.finding_signature import finding_signature
+from app.utils.money_parse import parse_monetary_amount
 from app.config import get_settings
 
 from app.agents.cross_checker.adjudication import _llm_assess_amount_pair, _llm_adjudicate_check
@@ -23,6 +25,30 @@ from app.agents.cross_checker.evidence import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Parallel LLM adjudication (Phase 1 pairs, Phase 2 checklist items). Kept small:
+# the relation model is the expensive one and OpenRouter rate-limits per key.
+_ADJUDICATION_CONCURRENCY = 3
+
+
+class _StepBuffer:
+    """
+    Collects reasoning steps from a concurrent worker instead of streaming them.
+
+    Workers run out of order, but the trace the user sees (and the persisted
+    reasoning_trace) must stay in checklist order — so each worker buffers its
+    steps and the orchestrator flushes them in index order after gathering.
+    """
+
+    def __init__(self) -> None:
+        self._pending: list[tuple[str, str, dict]] = []
+
+    def emit(self, step_type: str, content: str, **kwargs) -> None:
+        self._pending.append((step_type, content, kwargs))
+
+    def flush(self, writer, new_steps: list[ReasoningStep]) -> None:
+        for step_type, content, kwargs in self._pending:
+            new_steps.append(_emit(writer, step_type, content, **kwargs))
 
 
 async def cross_checker_agent(state: AuditState) -> dict:
@@ -37,6 +63,11 @@ async def cross_checker_agent(state: AuditState) -> dict:
     checklist = state.get("checklist", [])
     doc_ids = [doc.doc_id for doc in documents]
     doc_ids_str = ",".join(doc_ids)
+
+    # Every tool below uses a sync driver (Neo4j bolt, Qdrant HTTP) and
+    # search_hybrid_rag can make a sync LLM call inside _extract_query_entities.
+    # Offloading keeps SSE keepalives and other requests responsive during an audit.
+    loop = asyncio.get_running_loop()
 
     settings = get_settings()
     _gate_kwargs = dict(
@@ -73,7 +104,9 @@ async def cross_checker_agent(state: AuditState) -> dict:
     new_steps.append(step)
 
     try:
-        graph_result = detect_graph_contradictions.invoke({"doc_ids": doc_ids_str})
+        graph_result = await loop.run_in_executor(
+            None, detect_graph_contradictions.invoke, {"doc_ids": doc_ids_str}
+        )
         graph_data = json.loads(graph_result)
         contradictions = graph_data.get("contradictions", [])
 
@@ -84,7 +117,11 @@ async def cross_checker_agent(state: AuditState) -> dict:
                          tool_output=f"{len(contradictions)} contradictions")
             new_steps.append(step)
 
-            for c in contradictions[:10]:  # limit to top 10
+            pair_semaphore = asyncio.Semaphore(_ADJUDICATION_CONCURRENCY)
+
+            async def _adjudicate_pair(c: dict) -> tuple[_StepBuffer, list[Finding], int]:
+                """Assess one graph pair. Buffers its steps; returns (buffer, findings, candidates)."""
+                buf = _StepBuffer()
                 raw1 = (c.get("norm1") or c.get("value1") or "").strip()
                 raw2 = (c.get("norm2") or c.get("value2") or "").strip()
                 doc1 = c.get("doc1_name", c.get("doc1_id", "Doc 1"))
@@ -94,87 +131,86 @@ async def cross_checker_agent(state: AuditState) -> dict:
 
                 if not raw1 or not raw2:
                     logger.debug("Skipping graph pair with empty amount: %s / %s", raw1, raw2)
-                    continue
+                    return buf, [], 0
                 if parse_monetary_amount(raw1) is None or parse_monetary_amount(raw2) is None:
                     logger.debug("Skipping ambiguous graph amounts: %r / %r", raw1, raw2)
-                    continue
+                    return buf, [], 0
 
                 ev1 = f"{doc1}, page {page1}: {c.get('value1', raw1)}"
                 ev2 = f"{doc2}, page {page2}: {c.get('value2', raw2)}"
                 pair_ctx = _graph_context_for_compare(c, doc1, doc2)
 
                 # LLM first: validate that this is a meaningful like-with-like comparison.
-                llm_pair = await _llm_assess_amount_pair(
-                    raw1, raw2, pair_ctx, [ev1, ev2]
-                )
+                async with pair_semaphore:
+                    llm_pair = await _llm_assess_amount_pair(raw1, raw2, pair_ctx, [ev1, ev2])
                 if not llm_pair:
                     logger.debug("Skipping graph pair due to missing LLM adjudication: %s vs %s", raw1, raw2)
-                    continue
+                    return buf, [], 0
                 if not llm_pair.get("is_valid_comparison", False):
                     logger.debug("LLM rejected graph pair as invalid comparison: %s vs %s", raw1, raw2)
-                    continue
+                    return buf, [], 0
 
-                compare_result = {
-                    "is_contradiction": llm_pair.get("is_contradiction", False),
-                    "severity": llm_pair.get("severity", "ok"),
-                    "confidence": llm_pair.get("confidence", 0.75),
-                    "explanation": llm_pair.get("explanation", ""),
-                }
+                if not llm_pair.get("is_contradiction", False):
+                    return buf, [], 0
 
-                if compare_result.get("is_contradiction"):
-                    severity = compare_result.get("severity", "warning")
-                    confidence = compare_result.get("confidence", 0.8)
-                    explanation = compare_result.get("explanation", "")
-                    if severity == "critical" and (
-                        not _evidence_line_backs_value(ev1, raw1)
-                        or not _evidence_line_backs_value(ev2, raw2)
-                    ):
-                        severity = "warning"
-                        explanation = (
-                            "Extraction anomaly / needs review: amounts could not be verified "
-                            "against cited snippets; treating as non-critical. " + explanation
-                        )
-
-                    candidate = Finding(
-                        severity=severity,
-                        title=f"Amount Contradiction: {raw1} vs {raw2}",
-                        description=explanation,
-                        confidence_score=confidence,
-                        source_doc_id=c.get("doc1_id"),
-                        source_page=page1,
-                        conflicting_doc_id=c.get("doc2_id"),
-                        conflicting_page=page2,
-                        evidence=[ev1, ev2],
-                        recommendation="Verify the correct amount with the contracting parties and request a corrected document.",
+                severity = llm_pair.get("severity", "warning")
+                confidence = llm_pair.get("confidence", 0.8)
+                explanation = llm_pair.get("explanation", "")
+                if severity == "critical" and (
+                    not _evidence_line_backs_value(ev1, raw1)
+                    or not _evidence_line_backs_value(ev2, raw2)
+                ):
+                    severity = "warning"
+                    explanation = (
+                        "Extraction anomaly / needs review: amounts could not be verified "
+                        "against cited snippets; treating as non-critical. " + explanation
                     )
-                    _candidates_total += 1
-                    accepted, rejection_reason = _accept_finding(
-                        candidate, source="graph", **_gate_kwargs
-                    )
-                    if accepted and _is_suppressed(candidate):
-                        step = _emit(writer, "thought",
-                                     f"Skipping finding suppressed by prior reviewer feedback: "
-                                     f"{raw1} vs {raw2}")
-                        new_steps.append(step)
-                        continue
-                    if accepted:
-                        _accepted_total += 1
-                        step = _emit(writer, "finding",
-                                     f"CONTRADICTION DETECTED: {raw1} vs {raw2}\n"
-                                     f"Source: {doc1} (p.{page1}) ↔ {doc2} (p.{page2})\n"
-                                     f"Severity: {severity.upper()} | Confidence: {confidence:.0%}")
-                        new_steps.append(step)
-                        findings.append(candidate)
-                    else:
-                        logger.info(
-                            "Gate rejected graph finding %r: %s",
-                            candidate.title[:60],
-                            rejection_reason,
-                        )
-                        step = _emit(writer, "thought",
-                                     f"Graph finding filtered out (precision gate: {rejection_reason}): "
-                                     f"{raw1} vs {raw2}")
-                        new_steps.append(step)
+
+                candidate = Finding(
+                    severity=severity,
+                    title=f"Amount Contradiction: {raw1} vs {raw2}",
+                    description=explanation,
+                    confidence_score=confidence,
+                    source_doc_id=c.get("doc1_id"),
+                    source_page=page1,
+                    conflicting_doc_id=c.get("doc2_id"),
+                    conflicting_page=page2,
+                    evidence=[ev1, ev2],
+                    recommendation="Verify the correct amount with the contracting parties and request a corrected document.",
+                )
+                accepted, rejection_reason = _accept_finding(
+                    candidate, source="graph", **_gate_kwargs
+                )
+                if accepted and _is_suppressed(candidate):
+                    buf.emit("thought",
+                             f"Skipping finding suppressed by prior reviewer feedback: "
+                             f"{raw1} vs {raw2}")
+                    return buf, [], 1
+                if accepted:
+                    buf.emit("finding",
+                             f"CONTRADICTION DETECTED: {raw1} vs {raw2}\n"
+                             f"Source: {doc1} (p.{page1}) ↔ {doc2} (p.{page2})\n"
+                             f"Severity: {severity.upper()} | Confidence: {confidence:.0%}")
+                    return buf, [candidate], 1
+
+                logger.info(
+                    "Gate rejected graph finding %r: %s", candidate.title[:60], rejection_reason,
+                )
+                buf.emit("thought",
+                         f"Graph finding filtered out (precision gate: {rejection_reason}): "
+                         f"{raw1} vs {raw2}")
+                return buf, [], 1
+
+            # Adjudicate the top-10 pairs concurrently, then replay results in the
+            # original (materiality-ordered) sequence so the trace stays deterministic.
+            pair_results = await asyncio.gather(
+                *[_adjudicate_pair(c) for c in contradictions[:10]]
+            )
+            for buf, pair_findings, candidate_count in pair_results:
+                buf.flush(writer, new_steps)
+                findings.extend(pair_findings)
+                _candidates_total += candidate_count
+                _accepted_total += len(pair_findings)
         else:
             step = _emit(writer, "tool_result",
                          "No direct graph contradictions found. Proceeding with semantic checks.",
@@ -183,7 +219,8 @@ async def cross_checker_agent(state: AuditState) -> dict:
             new_steps.append(step)
 
     except Exception as e:
-        logger.warning("Graph contradiction detection failed: %s", e)
+        # exc_info: this handler previously hid a NameError for the whole phase.
+        logger.warning("Graph contradiction detection failed: %s", e, exc_info=True)
         step = _emit(writer, "thought", f"Graph analysis unavailable ({e}). Continuing with semantic checks.")
         new_steps.append(step)
 
@@ -191,23 +228,62 @@ async def cross_checker_agent(state: AuditState) -> dict:
     # Pre-fetch all bank-statement chunks once; every bank-reconciliation check below
     # augments its results with the same full set, so re-fetching per item is wasteful.
     bank_doc_ids = [d.doc_id for d in documents if _is_bank_doc(d)]
-    full_bank_chunks = get_all_chunks_for_docs(bank_doc_ids) if bank_doc_ids else []
+    full_bank_chunks = (
+        await loop.run_in_executor(None, get_all_chunks_for_docs, bank_doc_ids)
+        if bank_doc_ids
+        else []
+    )
 
-    for i, item in enumerate(checklist):
-        step = _emit(writer, "thought",
-                     f"[{i+1}/{len(checklist)}] {item.description} [{item.priority.upper()} priority]")
-        new_steps.append(step)
+    check_semaphore = asyncio.Semaphore(_ADJUDICATION_CONCURRENCY)
+
+    def _collect_llm_findings(
+        buf: _StepBuffer,
+        llm_findings: list[Finding],
+        label: str,
+        none_message: str,
+    ) -> tuple[list[Finding], int]:
+        """
+        Gate, suppress, and narrate one adjudication result set.
+
+        Shared by the amount and date branches, which previously carried ~40 lines
+        of identical accept/suppress/emit logic each.
+        """
+        kept: list[Finding] = []
+        for lf in llm_findings:
+            accepted, rejection_reason = _accept_finding(lf, source="llm", **_gate_kwargs)
+            if accepted and _is_suppressed(lf):
+                buf.emit("thought",
+                         f"Skipping finding suppressed by prior reviewer feedback: {lf.title[:80]}")
+                continue
+            if accepted:
+                kept.append(lf)
+                buf.emit("finding", f"{label}: {lf.title} — {lf.severity.upper()}")
+            else:
+                logger.info(
+                    "Gate rejected %s %r: %s", label.lower(), lf.title[:60], rejection_reason,
+                )
+                buf.emit("thought",
+                         f"{label} filtered out (precision gate: {rejection_reason}): "
+                         f"{lf.title[:80]}")
+        if not llm_findings or not kept:
+            buf.emit("thought", none_message)
+        return kept, len(llm_findings)
+
+    async def _run_check(i: int, item) -> tuple[_StepBuffer, list[Finding], int]:
+        """Retrieve + adjudicate one checklist item. Buffers its steps for ordered replay."""
+        buf = _StepBuffer()
+        buf.emit("thought",
+                 f"[{i+1}/{len(checklist)}] {item.description} [{item.priority.upper()} priority]")
 
         # Build a targeted query for this checklist item
         query = item.description
         item_doc_ids = item.doc_ids_involved or doc_ids
         item_intents = _classify_check_intents(item.description, item.check_type)
 
-        step = _emit(writer, "tool_call",
-                     f"Searching across documents: '{query[:80]}...' " if len(query) > 80 else f"Searching: '{query}'",
-                     tool_name="search_hybrid_rag",
-                     tool_input={"query": query, "doc_ids": ",".join(item_doc_ids)})
-        new_steps.append(step)
+        buf.emit("tool_call",
+                 f"Searching across documents: '{query[:80]}...' " if len(query) > 80 else f"Searching: '{query}'",
+                 tool_name="search_hybrid_rag",
+                 tool_input={"query": query, "doc_ids": ",".join(item_doc_ids)})
 
         try:
             is_bank_recon = bool({
@@ -217,11 +293,15 @@ async def cross_checker_agent(state: AuditState) -> dict:
             } & item_intents)
             recon_top_k = 20 if is_bank_recon else 8
 
-            search_raw = search_hybrid_rag.invoke({
-                "query": query,
-                "doc_ids": ",".join(item_doc_ids),
-                "top_k": recon_top_k,
-            })
+            search_raw = await loop.run_in_executor(
+                None,
+                search_hybrid_rag.invoke,
+                {
+                    "query": query,
+                    "doc_ids": ",".join(item_doc_ids),
+                    "top_k": recon_top_k,
+                },
+            )
             search_data = json.loads(search_raw)
             results = search_data.get("results", [])
 
@@ -233,102 +313,50 @@ async def cross_checker_agent(state: AuditState) -> dict:
                         existing_texts.add(key)
                         results.append(chunk)
 
-            step = _emit(writer, "tool_result",
-                         f"Found {len(results)} relevant passages "
-                         f"({search_data.get('vector_count', 0)} semantic, "
-                         f"{search_data.get('graph_count', 0)} graph).",
-                         tool_name="search_hybrid_rag",
-                         tool_output=f"{len(results)} results")
-            new_steps.append(step)
+            buf.emit("tool_result",
+                     f"Found {len(results)} relevant passages "
+                     f"({search_data.get('vector_count', 0)} semantic, "
+                     f"{search_data.get('graph_count', 0)} graph).",
+                     tool_name="search_hybrid_rag",
+                     tool_output=f"{len(results)} results")
 
             # LLM-only adjudication over extracted snippets.
             if item.check_type in ("amount_match", "cross_doc_consistency") and len(item_doc_ids) > 1:
                 llm_cap = 1 if is_bank_recon else 4
-                llm_findings = await _llm_adjudicate_check(
-                    item, results, documents, max_findings=llm_cap
-                )
-                accepted_here = 0
-                for lf in llm_findings:
-                    _candidates_total += 1
-                    accepted, rejection_reason = _accept_finding(
-                        lf, source="llm", **_gate_kwargs
+                async with check_semaphore:
+                    llm_findings = await _llm_adjudicate_check(
+                        item, results, documents, max_findings=llm_cap
                     )
-                    if accepted and _is_suppressed(lf):
-                        step = _emit(writer, "thought",
-                                     f"Skipping finding suppressed by prior reviewer feedback: "
-                                     f"{lf.title[:80]}")
-                        new_steps.append(step)
-                        continue
-                    if accepted:
-                        _accepted_total += 1
-                        accepted_here += 1
-                        findings.append(lf)
-                        step = _emit(
-                            writer,
-                            "finding",
-                            f"LLM finding: {lf.title} — {lf.severity.upper()}",
-                        )
-                        new_steps.append(step)
-                    else:
-                        logger.info(
-                            "Gate rejected LLM amount finding %r: %s",
-                            lf.title[:60],
-                            rejection_reason,
-                        )
-                        step = _emit(writer, "thought",
-                                     f"LLM finding filtered out (precision gate: {rejection_reason}): "
-                                     f"{lf.title[:80]}")
-                        new_steps.append(step)
-                if not llm_findings or accepted_here == 0:
-                    step = _emit(
-                        writer,
-                        "thought",
-                        "LLM review found no reliable contradiction for this check.",
-                    )
-                    new_steps.append(step)
+                return (buf, *_collect_llm_findings(
+                    buf, llm_findings, "LLM finding",
+                    "LLM review found no reliable contradiction for this check.",
+                ))
 
-            elif item.check_type == "date_consistency":
-                llm_findings = await _llm_adjudicate_check(item, results, documents)
-                accepted_here = 0
-                for lf in llm_findings:
-                    _candidates_total += 1
-                    accepted, rejection_reason = _accept_finding(
-                        lf, source="llm", **_gate_kwargs
-                    )
-                    if accepted and _is_suppressed(lf):
-                        step = _emit(writer, "thought",
-                                     f"Skipping finding suppressed by prior reviewer feedback: "
-                                     f"{lf.title[:80]}")
-                        new_steps.append(step)
-                        continue
-                    if accepted:
-                        _accepted_total += 1
-                        accepted_here += 1
-                        findings.append(lf)
-                        step = _emit(
-                            writer,
-                            "finding",
-                            f"LLM date finding: {lf.title} — {lf.severity.upper()}",
-                        )
-                        new_steps.append(step)
-                    else:
-                        logger.info(
-                            "Gate rejected LLM date finding %r: %s",
-                            lf.title[:60],
-                            rejection_reason,
-                        )
-                        step = _emit(writer, "thought",
-                                     f"LLM date finding filtered out (precision gate: {rejection_reason}): "
-                                     f"{lf.title[:80]}")
-                        new_steps.append(step)
-                if not llm_findings or accepted_here == 0:
-                    step = _emit(writer, "thought", "LLM date review found no reliable inconsistency.")
-                    new_steps.append(step)
+            if item.check_type == "date_consistency":
+                async with check_semaphore:
+                    llm_findings = await _llm_adjudicate_check(item, results, documents)
+                return (buf, *_collect_llm_findings(
+                    buf, llm_findings, "LLM date finding",
+                    "LLM date review found no reliable inconsistency.",
+                ))
+
+            return buf, [], 0
 
         except Exception as e:
             logger.warning("Check failed for item '%s': %s", item.description, e)
-            step = _emit(writer, "thought", f"Could not complete check '{item.description[:50]}...': {e}")
-            new_steps.append(step)
+            buf.emit("thought", f"Could not complete check '{item.description[:50]}...': {e}")
+            return buf, [], 0
+
+    # Run checklist items concurrently, then replay in checklist order. Deterministic
+    # ordering matters: the Phase-3 dedup loop below is order-sensitive.
+    check_results = await asyncio.gather(
+        *[_run_check(i, item) for i, item in enumerate(checklist)]
+    )
+    for buf, item_findings, candidate_count in check_results:
+        buf.flush(writer, new_steps)
+        findings.extend(item_findings)
+        _candidates_total += candidate_count
+        _accepted_total += len(item_findings)
 
     # ── Precision gate observability ──────────────────────────────────────────
     logger.info(
