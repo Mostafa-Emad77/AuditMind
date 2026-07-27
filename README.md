@@ -20,6 +20,8 @@ Upload invoices, contracts, bank statements, or balance sheets (scanned or digit
 8. **Streams** every agent reasoning step over **SSE** to the Next.js UI  
 9. **Answers questions** about audited documents via retrieval-grounded conversational Q&A  
 10. **Supports finding triage** — accept, dismiss, or mark as false positive with persistent signature suppression  
+11. **Archives** every past audit per API-key scope, browsable at `/archive`  
+12. **Exports** the reconciliation conflict table as CSV, and the full report as JSON  
 
 ---
 
@@ -57,7 +59,7 @@ flowchart TD
 
 **Infra (Docker Compose):** Redis (sessions + reports + chat + triage, 7-day TTL), Qdrant, FastAPI backend, Next.js frontend. **Neo4j** is external (e.g. [Neo4j Aura](https://neo4j.com/cloud/platform/aura-graph-database/)) — configure `NEO4J_*` in `backend/.env`. The audit pipeline runs as a background `asyncio.Task` decoupled from SSE connections.
 
-**Performance:** multi-document uploads are ingested (OCR + embedding) concurrently in a thread pool sized to `os.cpu_count()`. Entity extraction runs per-document in parallel with `asyncio.gather`. Hybrid-RAG query routing and checklist-intent classification are rule-based (no per-item LLM calls). All cross-checker LLM calls use `ainvoke` so they don't block the event loop or SSE keepalives. The audit pipeline runs as a free-standing `asyncio.Task` decoupled from SSE connections — a client disconnect won't cancel the audit.
+**Performance:** multi-document uploads are ingested (OCR + embedding) concurrently in a thread pool sized to `os.cpu_count()`. Entity extraction runs per-document in parallel with `asyncio.gather`. Hybrid-RAG query routing and checklist-intent classification are rule-based (no per-item LLM calls). Document type classification runs the regex heuristic first and only falls back to an LLM call when it can't decide. Within the cross-checker, both adjudication phases (graph pair validation, checklist-item checks) run concurrently under a `semaphore=3` `asyncio.gather`, and every sync tool call (Neo4j, Qdrant, hybrid retrieval) is offloaded to an executor — none of it blocks the event loop or SSE keepalives. Reasoning-step ordering stays deterministic despite the concurrency via a small step-buffering scheme that replays each worker's output in original order. The Qdrant client and collection/index setup are singletons initialized once at startup rather than per request. The audit pipeline runs as a free-standing `asyncio.Task` decoupled from SSE connections — a client disconnect won't cancel the audit.
 
 ---
 
@@ -146,6 +148,7 @@ npm run dev
 |----------|--------|-------------|
 | `/health` | GET | Health check (includes Redis reachability) |
 | `/api/upload` | POST | Upload PDFs; returns `audit_id` and document metadata |
+| `/api/audits` | GET | List past audits for the caller's API-key scope, newest first (Archive page) |
 | `/api/audit/{id}/start` | POST | Start (or resume) background audit pipeline |
 | `/api/audit/{id}/stream` | GET | SSE stream of agent events |
 | `/api/audit/{id}/report` | GET | Completed audit report (JSON) |
