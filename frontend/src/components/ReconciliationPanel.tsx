@@ -76,9 +76,11 @@ export function ReconciliationPanel({
   };
 
   const handleExportCsv = () => {
-    const header = ["Entity ID", "Doc A (Contract)", "Doc A Value", "Doc B (Invoice)", "Doc B Value", "Conflict Type"];
+    const header = [
+      "Why Compared", "Doc A", "Doc A Value", "Doc B", "Doc B Value", "Severity",
+    ];
     const lines = sortedRows.map((r) => [
-      r.entity_label,
+      r.conflict_type || r.entity_label,
       shortDocLabel(r.doc_a_id, docFilenameById),
       r.doc_a_value,
       shortDocLabel(r.doc_b_id, docFilenameById),
@@ -204,10 +206,10 @@ export function ReconciliationPanel({
               <thead>
                 <tr className="bg-secondary border-b border-outline-variant">
                   {[
-                    { key: "entity" as SortKey, label: "Entity ID" },
-                    { key: "doc_a" as SortKey, label: "Doc A (Contract)" },
-                    { key: "doc_b" as SortKey, label: "Doc B (Invoice)" },
-                    { key: "severity" as SortKey, label: "Conflict Type" },
+                    { key: "entity" as SortKey, label: "Why Compared" },
+                    { key: "doc_a" as SortKey, label: "Doc A" },
+                    { key: "doc_b" as SortKey, label: "Doc B" },
+                    { key: "severity" as SortKey, label: "Severity" },
                   ].map(({ key, label }) => (
                     <th key={key} className="py-3 px-4 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
                       <button
@@ -233,9 +235,13 @@ export function ReconciliationPanel({
                   return (
                     <tr key={i} className="border-b border-outline-variant last:border-0 hover:bg-secondary transition-colors">
                       <td className="py-3 px-4 align-top">
-                        <p className="text-[13px] font-medium text-foreground max-w-[180px] truncate">{r.entity_label}</p>
+                        <p className="text-[13px] font-medium text-foreground max-w-[220px]">
+                          {r.conflict_type || r.entity_label}
+                        </p>
                         {r.anchor_hint && (
-                          <p className="text-[11px] text-muted-foreground mt-0.5 truncate">{r.anchor_hint}</p>
+                          <p className="text-[11px] text-muted-foreground mt-0.5 truncate max-w-[220px]">
+                            via {r.anchor_hint}
+                          </p>
                         )}
                       </td>
                       <td className="py-3 px-4 align-top">

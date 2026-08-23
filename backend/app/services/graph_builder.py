@@ -152,6 +152,9 @@ def store_entities(entities: list[Entity]) -> None:
             "numeral_mismatch": getattr(e, "numeral_mismatch", None),
             "amount_value": getattr(e, "amount_value", None),
             "amount_currency": getattr(e, "amount_currency", None),
+            "role_title": getattr(e, "role_title", None),
+            "signing_authority_level": getattr(e, "signing_authority_level", None),
+            "document_signed": getattr(e, "document_signed", None),
         }
         for e in entities
     ]
@@ -177,6 +180,12 @@ def store_entities(entities: list[Entity]) -> None:
                     e.numeral_mismatch = rec.numeral_mismatch,
                     e.amount_value = rec.amount_value,
                     e.amount_currency = rec.amount_currency,
+                    e.role_title = rec.role_title,
+                    e.signing_authority_level = rec.signing_authority_level,
+                    e.documents_signed = CASE
+                        WHEN rec.document_signed IS NULL THEN []
+                        ELSE [rec.document_signed]
+                    END,
                     e.source_doc_ids = [rec.source_doc_id],
                     e.source_pages = [rec.source_page],
                     e.mention_count = 1
@@ -200,7 +209,21 @@ def store_entities(entities: list[Entity]) -> None:
                     e.western_numeral_form = coalesce(e.western_numeral_form, rec.western_numeral_form),
                     e.arabic_indic_numeral_form = coalesce(e.arabic_indic_numeral_form, rec.arabic_indic_numeral_form),
                     e.amount_value = coalesce(e.amount_value, rec.amount_value),
-                    e.amount_currency = coalesce(e.amount_currency, rec.amount_currency)
+                    e.amount_currency = coalesce(e.amount_currency, rec.amount_currency),
+                    e.role_title = coalesce(e.role_title, rec.role_title),
+                    e.signing_authority_level = coalesce(
+                        e.signing_authority_level, rec.signing_authority_level
+                    ),
+                    // Person nodes dedupe globally, so one signatory seen across several
+                    // documents accumulates everything they signed — that list is what
+                    // makes signatory/authority mismatches detectable.
+                    e.documents_signed = CASE
+                        WHEN rec.document_signed IS NULL
+                            THEN coalesce(e.documents_signed, [])
+                        WHEN rec.document_signed IN coalesce(e.documents_signed, [])
+                            THEN e.documents_signed
+                        ELSE coalesce(e.documents_signed, []) + rec.document_signed
+                    END
                 WITH e, rec
                 MATCH (d:Document {doc_id: rec.source_doc_id})
                 MERGE (e)-[:FOUND_IN]->(d)
@@ -254,32 +277,81 @@ def store_relationships(relationships: list[Relationship]) -> None:
     _run_with_reconnect(_run)
 
 
-_COMPATIBLE_AMOUNT_ROLES: set[tuple[str, str]] = {
-    ("total_contract_value", "total_invoice"),
-    ("total_invoice", "total_contract_value"),
-    ("total_contract_value", "total_contract_value"),
-    ("total_invoice", "total_invoice"),
-    ("milestone_scheduled", "milestone_scheduled"),
-    ("retainer", "retainer"),
-    ("single_payment", "single_payment"),
-    ("milestone_scheduled", "single_payment"),
-    ("single_payment", "milestone_scheduled"),
-    ("retainer", "single_payment"),
-    ("single_payment", "retainer"),
+# Explicit allow-list of amount-role pairs that are meaningful to compare, each with a
+# human-readable reason explaining WHY the two are comparable. The reason is surfaced as
+# the conflict_type on exported rows, so a reviewer sees "contract total vs invoice's
+# stated contract value" instead of an opaque "Doc A vs Doc B".
+#
+# Pairs are declared once, unordered; the symmetric lookup is built below. Anything not
+# listed here is NOT compared — co-occurring in a chunk or sharing a document ID is
+# explicitly not sufficient grounds to compare two amounts.
+_COMPARABLE_ROLE_REASONS: dict[frozenset[str], str] = {
+    frozenset({"total_contract_value", "total_invoice"}):
+        "contract total vs invoice total",
+    # The restatement check: an invoice asserting a different contract value than the
+    # contract itself states is a real finding, which is why these carry distinct roles.
+    frozenset({"total_contract_value", "invoice_referenced_contract_value"}):
+        "contract total vs invoice's stated contract reference",
+    frozenset({"total_contract_value"}):
+        "contract total vs contract total across documents",
+    frozenset({"total_invoice"}):
+        "invoice total vs invoice total across documents",
+    frozenset({"invoice_referenced_contract_value"}):
+        "invoice's stated contract reference vs another invoice's",
+    frozenset({"total_invoice", "invoice_subtotal"}):
+        "invoice total vs invoice subtotal (VAT reconciliation)",
+    frozenset({"milestone_scheduled"}):
+        "scheduled milestone vs scheduled milestone",
+    frozenset({"retainer"}):
+        "retainer rate vs retainer rate",
+    frozenset({"milestone_scheduled", "transaction_debit"}):
+        "scheduled milestone vs bank payment",
+    frozenset({"retainer", "transaction_debit"}):
+        "retainer rate vs bank payment",
+    frozenset({"transaction_debit"}):
+        "bank payment vs bank payment",
+    # Legacy `single_payment` (pre debit/credit split) kept comparable so historical
+    # graph data keeps producing findings.
+    frozenset({"single_payment"}):
+        "bank payment vs bank payment",
+    frozenset({"milestone_scheduled", "single_payment"}):
+        "scheduled milestone vs bank payment",
+    frozenset({"retainer", "single_payment"}):
+        "retainer rate vs bank payment",
+    # NOTE: invoice_total vs an individual payment is deliberately NOT here. An invoice
+    # is legitimately settled by several installments, so it must be reconciled against
+    # the SUM of payments (see reconciliation_payload), never pairwise against one debit.
 }
 
-_INCOMPATIBLE_ROLES: set[str] = {"opening_balance", "closing_balance"}
+# Roles that must never participate in a contradiction comparison: cumulative account
+# state and pre-aggregated statement totals are not transaction values, so comparing
+# them against line items is meaningless by construction.
+_INCOMPATIBLE_ROLES: frozenset[str] = frozenset({
+    "opening_balance",
+    "closing_balance",
+    "running_balance",
+    "statement_total_debits",
+    "statement_total_credits",
+})
+
+
+def _role_pair_reason(role1: str, role2: str) -> str | None:
+    """Return the human-readable reason two roles are comparable, or None if they aren't."""
+    r1 = (role1 or "unknown").strip().lower()
+    r2 = (role2 or "unknown").strip().lower()
+    if r1 in _INCOMPATIBLE_ROLES or r2 in _INCOMPATIBLE_ROLES:
+        return None
+    # `unknown` used to pass through as comparable, which — combined with untagged
+    # running balances — is what produced conflicts like "running balance 750,000 vs
+    # line item 25,000". An unclassified amount is no longer grounds for comparison.
+    if r1 == "unknown" or r2 == "unknown":
+        return None
+    return _COMPARABLE_ROLE_REASONS.get(frozenset({r1, r2}))
 
 
 def _roles_are_comparable(role1: str, role2: str) -> bool:
     """Return True if two amount_roles should be compared for contradictions."""
-    r1 = (role1 or "unknown").strip().lower()
-    r2 = (role2 or "unknown").strip().lower()
-    if r1 in _INCOMPATIBLE_ROLES or r2 in _INCOMPATIBLE_ROLES:
-        return False
-    if r1 == "unknown" or r2 == "unknown":
-        return True
-    return (r1, r2) in _COMPATIBLE_AMOUNT_ROLES
+    return _role_pair_reason(role1, role2) is not None
 
 
 def find_contradictions(doc_ids: list[str]) -> list[dict]:
@@ -312,8 +384,10 @@ def find_contradictions(doc_ids: list[str]) -> list[dict]:
                   AND d1.doc_id <> d2.doc_id
                   AND d1.doc_id IN $doc_ids
                   AND d2.doc_id IN $doc_ids
-                  AND NOT coalesce(e1.amount_role, 'unknown') IN ['opening_balance', 'closing_balance']
-                  AND NOT coalesce(e2.amount_role, 'unknown') IN ['opening_balance', 'closing_balance']
+                  // Cumulative balances and pre-aggregated statement totals are not
+                  // transaction values — excluded here so they never reach the LLM.
+                  AND NOT coalesce(e1.amount_role, 'unknown') IN $excluded_roles
+                  AND NOT coalesce(e2.amount_role, 'unknown') IN $excluded_roles
                   // Currency must match when both are known (USD vs EGP is not a contradiction).
                   AND (
                        e1.amount_currency IS NULL
@@ -368,15 +442,23 @@ def find_contradictions(doc_ids: list[str]) -> list[dict]:
                 LIMIT 50
                 """,
                 doc_ids=doc_ids,
+                excluded_roles=sorted(_INCOMPATIBLE_ROLES),
             )
             return [dict(r) for r in result]
 
     rows = _run_with_reconnect(_run)
 
-    # Apply the full role-compatibility matrix. The Cypher only excludes
-    # opening/closing balances; pairs like retainer vs total_contract_value would
-    # otherwise reach the LLM and burn an adjudication call each.
-    kept = [r for r in rows if _roles_are_comparable(r.get("role1"), r.get("role2"))]
+    # Apply the full role-compatibility allow-list. The Cypher only drops the
+    # never-comparable roles; this rejects pairs like retainer vs total_contract_value
+    # that would otherwise reach the LLM and burn an adjudication call each. The
+    # matched reason rides along so the report can say why the pair was compared.
+    kept: list[dict] = []
+    for r in rows:
+        reason = _role_pair_reason(r.get("role1"), r.get("role2"))
+        if reason is None:
+            continue
+        r["comparison_reason"] = reason
+        kept.append(r)
     if len(kept) < len(rows):
         logger.info(
             "find_contradictions: filtered %d/%d pair(s) with incomparable amount roles",
@@ -725,3 +807,75 @@ def query_graph_for_entities(query_entities: list[str], doc_ids: list[str], dept
             return rows
 
     return _run_with_reconnect(_run)
+
+
+def trace_document_linkage(doc_ids: list[str]) -> list[dict]:
+    """
+    Per-document diagnostic: how many entities each document contributed, and how many
+    graph edges actually touch them.
+
+    A document showing entities > 0 but cross_doc_edges == 0 is the signature of an
+    entity-resolution failure: its entities exist but never linked to the shared nodes
+    (same contract number, same vendor) that the cross-checker traverses — so it can
+    never contribute a cross-document finding.
+    """
+    if not doc_ids:
+        return []
+    settings = get_settings()
+
+    def _run(driver: Driver):
+        with driver.session(database=settings.neo4j_database) as session:
+            result = session.run(
+                """
+                MATCH (d:Document) WHERE d.doc_id IN $doc_ids
+                OPTIONAL MATCH (e:Entity)-[:FOUND_IN]->(d)
+                WITH d, collect(DISTINCT e) AS ents
+                UNWIND (CASE WHEN size(ents) = 0 THEN [null] ELSE ents END) AS e
+                OPTIONAL MATCH (e)-[r:RELATES]-(other:Entity)
+                OPTIONAL MATCH (other)-[:FOUND_IN]->(d2:Document)
+                WITH d,
+                     count(DISTINCT e) AS entity_count,
+                     count(DISTINCT r) AS edge_count,
+                     count(DISTINCT CASE
+                         WHEN d2 IS NOT NULL AND d2.doc_id <> d.doc_id THEN r
+                     END) AS cross_doc_edges,
+                     count(DISTINCT CASE
+                         WHEN e IS NOT NULL AND e.entity_type IN
+                             ['contract_id', 'invoice_id', 'company', 'person']
+                         THEN e
+                     END) AS shared_key_entities
+                RETURN d.doc_id AS doc_id,
+                       d.filename AS filename,
+                       entity_count,
+                       edge_count,
+                       cross_doc_edges,
+                       shared_key_entities
+                ORDER BY filename
+                """,
+                doc_ids=doc_ids,
+            )
+            return [dict(r) for r in result]
+
+    try:
+        rows = _run_with_reconnect(_run)
+    except Exception as e:
+        logger.warning("Document linkage trace failed: %s", e)
+        return []
+
+    for r in rows:
+        msg = (
+            "Linkage trace — %s: %d entities, %d edges (%d cross-doc), "
+            "%d globally-shared key entities"
+        )
+        args = (
+            r.get("filename"), r.get("entity_count", 0), r.get("edge_count", 0),
+            r.get("cross_doc_edges", 0), r.get("shared_key_entities", 0),
+        )
+        if r.get("entity_count", 0) > 0 and r.get("cross_doc_edges", 0) == 0:
+            logger.warning(
+                msg + " — ISOLATED: this document cannot produce cross-document findings",
+                *args,
+            )
+        else:
+            logger.info(msg, *args)
+    return rows

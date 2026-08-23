@@ -14,6 +14,7 @@ from app.services.graph_builder import (
     store_document_node,
     store_entities,
     store_relationships,
+    trace_document_linkage,
 )
 from app.config import get_settings
 
@@ -259,6 +260,28 @@ async def extraction_agent(state: AuditState) -> dict:
     for entities, relationships in results:
         all_entities.extend(entities)
         all_relationships.extend(relationships)
+
+    # Linkage trace: surfaces documents whose entities never joined the shared graph.
+    # A doc with entities but zero cross-doc edges can't contribute a cross-document
+    # finding no matter how good the cross-checker is, so name it explicitly here.
+    try:
+        trace_rows = await loop.run_in_executor(
+            None, trace_document_linkage, [d.doc_id for d in documents]
+        )
+        isolated = [
+            r for r in trace_rows
+            if r.get("entity_count", 0) > 0 and r.get("cross_doc_edges", 0) == 0
+        ]
+        if isolated:
+            names = ", ".join(str(r.get("filename")) for r in isolated)
+            step = _emit(
+                writer, "extraction", "thought",
+                f"Warning: {len(isolated)} document(s) extracted entities but linked to no "
+                f"other document ({names}). They cannot produce cross-document findings.",
+            )
+            new_steps.append(step)
+    except Exception as e:
+        logger.debug("Linkage trace skipped: %s", e)
 
     # Summary
     summary = (

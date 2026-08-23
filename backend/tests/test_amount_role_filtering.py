@@ -30,18 +30,24 @@ class TestRolesAreComparable:
     def test_single_payment_vs_total_invoice_is_incompatible(self):
         assert not _roles_are_comparable("single_payment", "total_invoice")
 
-    def test_unknown_vs_anything_passes(self):
-        assert _roles_are_comparable("unknown", "total_contract_value")
-        assert _roles_are_comparable("unknown", "single_payment")
-        assert _roles_are_comparable("unknown", "unknown")
+    def test_unknown_vs_anything_is_rejected(self):
+        """
+        `unknown` previously passed through as comparable-with-anything. Combined with
+        untagged running-balance figures, that is what produced conflicts like
+        "running balance 750,000 vs line item 25,000". An amount that could not be
+        classified is no longer grounds for comparison.
+        """
+        assert not _roles_are_comparable("unknown", "total_contract_value")
+        assert not _roles_are_comparable("unknown", "single_payment")
+        assert not _roles_are_comparable("unknown", "unknown")
 
     def test_milestone_vs_single_payment_is_compatible(self):
         assert _roles_are_comparable("milestone_scheduled", "single_payment")
         assert _roles_are_comparable("single_payment", "milestone_scheduled")
 
-    def test_none_treated_as_unknown(self):
-        assert _roles_are_comparable(None, "total_contract_value")
-        assert _roles_are_comparable(None, None)
+    def test_none_treated_as_unknown_and_rejected(self):
+        assert not _roles_are_comparable(None, "total_contract_value")
+        assert not _roles_are_comparable(None, None)
 
 
 # ── False positive regression: opening balance vs invoice ────────────────────

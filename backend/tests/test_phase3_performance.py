@@ -42,11 +42,26 @@ class TestFindContradictionsRoleFilter:
         assert kept[0]["role1"] == "total_contract_value"
         assert kept[0]["role2"] == "total_invoice"
 
-    def test_unknown_roles_are_kept(self, monkeypatch):
+    def test_unknown_roles_are_dropped(self, monkeypatch):
+        """
+        Unknown-role pairs used to be kept (treated as comparable-with-anything).
+        That permissiveness is what let untagged running balances be compared against
+        line items, so unclassified amounts are now excluded.
+        """
         rows = [_pair("unknown", "total_invoice"), _pair("unknown", "unknown")]
         monkeypatch.setattr(gb, "_run_with_reconnect", lambda _fn: rows)
 
-        assert len(gb.find_contradictions(["d1", "d2"])) == 2
+        assert gb.find_contradictions(["d1", "d2"]) == []
+
+    def test_comparison_reason_is_attached(self, monkeypatch):
+        """Kept pairs carry a human-readable reason for the report/CSV."""
+        rows = [_pair("total_contract_value", "invoice_referenced_contract_value")]
+        monkeypatch.setattr(gb, "_run_with_reconnect", lambda _fn: rows)
+
+        kept = gb.find_contradictions(["d1", "d2"])
+
+        assert len(kept) == 1
+        assert "contract" in kept[0]["comparison_reason"].lower()
 
     def test_empty_result_is_passed_through(self, monkeypatch):
         monkeypatch.setattr(gb, "_run_with_reconnect", lambda _fn: [])

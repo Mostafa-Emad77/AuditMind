@@ -28,16 +28,54 @@ class DocumentChunk(BaseModel):
 
 
 AMOUNT_ROLES = Literal[
+    # ── Contract-side ────────────────────────────────────────────────────────
     "total_contract_value",
-    "total_invoice",
-    "single_payment",
-    "opening_balance",
-    "closing_balance",
     "milestone_scheduled",
     "retainer",
+    # ── Invoice-side ─────────────────────────────────────────────────────────
+    "total_invoice",
+    "invoice_subtotal",
+    "invoice_line_item",
+    # An invoice RESTATING what it claims the contract total is. Deliberately
+    # distinct from total_contract_value — comparing the two is how restatement
+    # errors are caught, so they must never collapse into one role.
+    "invoice_referenced_contract_value",
+    # ── Bank-statement-side ──────────────────────────────────────────────────
+    "transaction_debit",
+    "transaction_credit",
+    # Statement-level summary figures — used to VALIDATE the summed transaction rows,
+    # never added to them (adding both double-counts the statement).
+    "statement_total_debits",
+    "statement_total_credits",
+    # Cumulative account state, NOT a transaction value. Must never be summed,
+    # compared against invoice/contract totals, or used in "total paid" math.
+    "running_balance",
+    "opening_balance",
+    "closing_balance",
+    # ── Other ────────────────────────────────────────────────────────────────
     "vat_tax",
+    "late_fee",
+    # Legacy: pre-dates the debit/credit split. Treated as transaction_debit by
+    # reconciliation so historical graph data keeps working.
+    "single_payment",
     "unknown",
 ]
+
+# Roles that represent cumulative account state or a pre-aggregated total rather than
+# an individual transaction value. Summing any of these is always a bug — it either
+# double-counts the whole account history (balances) or double-counts the rows
+# themselves (statement totals).
+NON_SUMMABLE_ROLES = frozenset({
+    "running_balance",
+    "opening_balance",
+    "closing_balance",
+    "statement_total_debits",
+    "statement_total_credits",
+})
+
+# Roles that count as money actually leaving the account. `single_payment` is the
+# pre-split legacy role and is treated as a debit for backwards compatibility.
+BANK_OUTFLOW_ROLES = frozenset({"transaction_debit", "single_payment"})
 
 
 class Entity(BaseModel):
@@ -61,6 +99,13 @@ class Entity(BaseModel):
     # instead of doing string-equality on `normalized_value`.
     amount_value: Optional[float] = None
     amount_currency: Optional[str] = None
+    # Person / signatory entities — enables authority-mismatch findings (e.g. an
+    # amendment signed by a CFO where the original was signed by the Chairman).
+    role_title: Optional[str] = None
+    signing_authority_level: Optional[
+        Literal["chairman", "ceo", "cfo", "director", "manager", "other", "unknown"]
+    ] = None
+    document_signed: Optional[str] = None
 
 
 class Relationship(BaseModel):
@@ -139,7 +184,10 @@ class EntityConflictRow(BaseModel):
     doc_b_id: str
     doc_b_value: str
     severity: Literal["critical", "warning"]
-    conflict_type: Literal["amount", "party_name", "date", "other"] = "amount"
+    # Human-readable explanation of WHY these two values were compared, derived from
+    # the matched role pair (e.g. "contract total vs invoice's stated contract
+    # reference"). Free-form rather than an enum so the reason can be specific.
+    conflict_type: str = "amount"
     anchor_hint: Optional[str] = None
 
 

@@ -59,7 +59,8 @@ export interface EntityConflictRow {
   doc_b_id: string;
   doc_b_value: string;
   severity: Severity;
-  conflict_type: "amount" | "party_name" | "date" | "other";
+  /** Human-readable reason the two values were compared, e.g. "contract total vs invoice total". */
+  conflict_type: string;
   anchor_hint?: string | null;
 }
 

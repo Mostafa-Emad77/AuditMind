@@ -150,7 +150,11 @@ def _classify_document_type_heuristic(text: str, filename: str) -> str:
     OCR-tolerant deterministic fallback classifier from content + filename.
     """
     text_lower = text.lower()
-    filename_lower = filename.lower()
+    # Separators become spaces so \b-anchored patterns can match: without this,
+    # "\bcontract\b" never matches "contract_CTR2024044.pdf" (an underscore is a word
+    # character, so there is no boundary after "contract") and the filename hint — often
+    # the strongest signal for a scanned document — silently contributes nothing.
+    filename_lower = re.sub(r"[^a-z0-9؀-ۿ]+", " ", filename.lower())
 
     patterns: dict[str, list[tuple[str, int]]] = {
         "invoice": [
@@ -209,8 +213,13 @@ def _classify_document_type_heuristic(text: str, filename: str) -> str:
     # Score both content and filename; filename is a strong hint for scanned docs.
     for doc_type, rules in patterns.items():
         for pattern, weight in rules:
-            if re.search(pattern, text_lower, flags=re.IGNORECASE):
-                scores[doc_type] += weight
+            # Frequency-weighted, with diminishing returns. Presence-only scoring made a
+            # contract saying "contract" 12 times indistinguishable from one passing
+            # mention, so a contract that merely referenced invoices and VAT could
+            # outscore its own type. The cap stops one repeated term monopolising.
+            hits = len(re.findall(pattern, text_lower, flags=re.IGNORECASE))
+            if hits:
+                scores[doc_type] += weight * min(hits, 3)
             if re.search(pattern, filename_lower, flags=re.IGNORECASE):
                 scores[doc_type] += max(1, weight // 2)
 

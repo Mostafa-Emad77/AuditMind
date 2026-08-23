@@ -2,18 +2,24 @@
 import asyncio
 import json
 import logging
-from typing import Optional, Callable, Awaitable
+from typing import Optional, Callable, Awaitable, get_args
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 
-from app.models.schemas import Entity, Relationship, DocumentChunk
+from app.models.schemas import AMOUNT_ROLES, Entity, Relationship, DocumentChunk
 from app.utils.llm_factory import get_llm
 from app.utils.canonical_id import canonical_entity_id, canonical_rel_id
 from app.utils.money_parse import parse_monetary_amount, extract_currency_code
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# Derived from the schema so the accepted set can never drift from the Literal.
+_VALID_AMOUNT_ROLES: frozenset[str] = frozenset(get_args(AMOUNT_ROLES))
+_VALID_AUTHORITY_LEVELS: frozenset[str] = frozenset(
+    {"chairman", "ceo", "cfo", "director", "manager", "other", "unknown"}
+)
 
 _EXTRACTION_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """You are a financial document analysis expert specializing in Arabic and English documents.
@@ -28,10 +34,13 @@ Return a JSON object with exactly this structure:
       "normalized_value": "cleaned/normalized version",
       "source_language": "arabic|english|mixed|unknown — language of the surface text for THIS entity span",
       "coreference_note": "null or short text: if the same real-world concept appears in Arabic in one place and English elsewhere in this chunk, state the link explicitly (e.g. 'same party as …')",
-      "amount_role": "(only for amount entities) one of: total_contract_value|total_invoice|single_payment|opening_balance|closing_balance|milestone_scheduled|retainer|vat_tax|unknown",
+      "amount_role": "(only for amount entities) one of: total_contract_value|milestone_scheduled|retainer|total_invoice|invoice_subtotal|invoice_line_item|invoice_referenced_contract_value|transaction_debit|transaction_credit|statement_total_debits|statement_total_credits|running_balance|opening_balance|closing_balance|vat_tax|late_fee|unknown",
       "western_numeral_form": "(only for amount entities, else null) the amount written with Western digits 0-9 if present",
       "arabic_indic_numeral_form": "(only for amount entities, else null) the amount written with Arabic-Indic digits ١٢٣ if present",
-      "numeral_mismatch": "(only for amount entities, else null) true if both forms above are present and denote different numeric values; false if both present and agree; null if only one script appears"
+      "numeral_mismatch": "(only for amount entities, else null) true if both forms above are present and denote different numeric values; false if both present and agree; null if only one script appears",
+      "role_title": "(only for person entities, else null) the person's stated title exactly as written, e.g. 'Chairman', 'CFO', 'CEO - Nile Financial Consulting'",
+      "signing_authority_level": "(only for person entities, else null) one of: chairman|ceo|cfo|director|manager|other|unknown",
+      "document_signed": "(only for person entities, else null) what this person signed in THIS chunk, e.g. 'contract CTR-2024-044' or 'amendment 1'; null if they are merely mentioned, not signing"
     }}
   ],
   "relationships": [
@@ -51,15 +60,46 @@ Rules:
 - BILINGUAL COREFERENCE: The same obligation, party, or amount may be named in Arabic in one clause and English in another. When you infer within this chunk that two mentions refer to the same real-world thing, record it in coreference_note for at least one of the entities; do not silently collapse distinct surface forms without stating the link.
 - For monetary amounts, always include the currency code in normalized_value (e.g., "50000 EGP")
 - For amount entities, you MUST set amount_role to classify the semantic purpose:
-  * total_contract_value — the full agreed contract price / total value
-  * total_invoice — the invoice grand total or total due
-  * single_payment — an individual bank transaction, wire transfer, or payment
-  * opening_balance — a bank statement opening / beginning balance
-  * closing_balance — a bank statement closing / ending balance
-  * milestone_scheduled — a scheduled installment or milestone payment in a contract schedule
-  * retainer — a monthly retainer fee in a contract schedule
+  CONTRACT-SIDE:
+  * total_contract_value — the full agreed contract price stated BY THE CONTRACT ITSELF
+  * milestone_scheduled — a scheduled installment / milestone payment in a contract payment schedule
+  * retainer — a recurring (e.g. monthly) retainer fee
+  INVOICE-SIDE:
+  * total_invoice — the invoice grand total / total due (after VAT)
+  * invoice_subtotal — the invoice subtotal BEFORE VAT
+  * invoice_line_item — a single line on an invoice, not any total
+  * invoice_referenced_contract_value — an invoice RESTATING what it claims the contract's
+    total value is (e.g. "against Contract CTR-2024-044, value EGP 180,000"). This is NOT
+    total_contract_value. Use this role whenever a NON-contract document asserts the
+    contract's value — comparing the two is precisely how restatement errors are caught,
+    so they must never be given the same role.
+  BANK-STATEMENT-SIDE (read the column headers carefully):
+  * transaction_debit — money OUT of the account on one transaction row (Debit column)
+  * transaction_credit — money IN to the account on one transaction row (Credit column)
+  * running_balance — the per-row Balance column showing the account balance AFTER that row
+  * statement_total_debits — the statement's own stated "Total Debits" summary figure
+  * statement_total_credits — the statement's own stated "Total Credits" summary figure
+  * opening_balance — the statement's opening / beginning balance
+  * closing_balance — the statement's closing / ending balance
+  OTHER:
   * vat_tax — a VAT or tax amount
-  * unknown — when the role cannot be determined
+  * late_fee — a late-payment penalty or interest charge
+  * unknown — ONLY when the role genuinely cannot be determined from context
+- BANK STATEMENT ROWS — three DISTINCT amounts per transaction row, NEVER merged:
+  A transaction row typically reads: Date | Ref | Description | Debit | Credit | Balance.
+  Emit a SEPARATE amount entity for each populated column, with its own role:
+  the Debit figure as transaction_debit, the Credit figure as transaction_credit,
+  and the Balance figure as running_balance. Never emit one merged "amount" for a row,
+  and never label a Balance figure as a debit or credit.
+- RUNNING BALANCE IS NOT A TRANSACTION: running_balance values are cumulative account
+  state, not transaction values. They must never be summed, never compared to invoice or
+  contract totals, and never used in any "total paid" calculation. Tagging a Balance-column
+  figure as anything other than running_balance corrupts every downstream total, so when a
+  number is a balance, always say so.
+- PERSON / SIGNATORY ENTITIES: for every named person, set role_title and
+  signing_authority_level from their stated title. Set document_signed only when the chunk
+  shows them actually signing/approving something. This is what enables authority-mismatch
+  detection (e.g. an amendment signed by a CFO where the original was signed by the Chairman).
 - For relationship_type, use richer types to distinguish:
   * total_value_of — links a total amount to its parent (contract, invoice)
   * payment_for — links a bank payment to the entity it pays
@@ -148,13 +188,7 @@ async def extract_entities_from_chunk(
                         kwargs["coreference_note"] = None
                     if etype == "amount":
                         raw_role = (e.get("amount_role") or "unknown").strip().lower()
-                        _valid_roles = {
-                            "total_contract_value", "total_invoice",
-                            "single_payment", "opening_balance",
-                            "closing_balance", "milestone_scheduled",
-                            "retainer", "vat_tax", "unknown",
-                        }
-                        kwargs["amount_role"] = raw_role if raw_role in _valid_roles else "unknown"
+                        kwargs["amount_role"] = raw_role if raw_role in _VALID_AMOUNT_ROLES else "unknown"
                         kwargs["amount_value"] = parsed_amount
                         kwargs["amount_currency"] = parsed_currency
                     else:
@@ -163,6 +197,15 @@ async def extract_entities_from_chunk(
                         kwargs["numeral_mismatch"] = None
                         kwargs["amount_value"] = None
                         kwargs["amount_currency"] = None
+                    if etype == "person":
+                        raw_auth = str(e.get("signing_authority_level") or "").strip().lower()
+                        kwargs["signing_authority_level"] = (
+                            raw_auth if raw_auth in _VALID_AUTHORITY_LEVELS else None
+                        )
+                        kwargs["role_title"] = (str(e.get("role_title")).strip() or None) \
+                            if e.get("role_title") is not None else None
+                        kwargs["document_signed"] = (str(e.get("document_signed")).strip() or None) \
+                            if e.get("document_signed") is not None else None
                     entities.append(Entity(**kwargs))
                 except Exception:
                     continue

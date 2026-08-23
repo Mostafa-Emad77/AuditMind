@@ -93,9 +93,11 @@ export function FileUpload({ onUploadComplete }: FileUploadProps) {
               Support for PDF up to {MAX_SIZE_MB}MB per file.
             </p>
           </div>
+          {/* No onClick: the click bubbles to the dropzone root, whose getRootProps()
+              handler opens the file picker. Stopping propagation here would make this
+              the one element in the zone that *can't* browse for files. */}
           <button
             type="button"
-            onClick={(e) => e.stopPropagation()}
             className="bg-[#131b2e] text-white text-sm font-medium px-5 py-2 rounded-lg hover:opacity-90 transition-opacity"
           >
             Browse Files

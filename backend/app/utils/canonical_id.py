@@ -12,6 +12,7 @@ edges.
 We intentionally keep `entity_id` / `rel_id` as the storage key (no schema
 migration required) — only the *values* become deterministic.
 """
+import re
 import uuid
 
 # Fixed namespace — must not change; rotating it would orphan all existing nodes.
@@ -21,6 +22,22 @@ _ENTITY_NAMESPACE = uuid.UUID("6f3a8f5a-2c1b-4d3e-8a9f-1b2c3d4e5f6a")
 # Other types (amount, date, clause, other) are scoped to their source document
 # because the same surface form can mean different things in different contexts.
 _GLOBAL_DEDUPE_TYPES = frozenset({"contract_id", "invoice_id", "company", "person"})
+
+# Identifier types where formatting is noise, not meaning: a contract referenced as
+# "CTR-2024-044" in one document and "CTR 2024 044" or "CTR2024044" in another is the
+# same contract. Without this, those variants become separate nodes and the documents
+# never link — the document contributes entities but zero cross-document edges.
+_IDENTIFIER_DEDUPE_TYPES = frozenset({"contract_id", "invoice_id"})
+
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def normalize_identifier(value: str) -> str:
+    """Collapse an identifier to its alphanumeric core for matching purposes.
+
+    "CTR-2024-044" / "ctr 2024 044" / "CTR2024044" all become "ctr2024044".
+    """
+    return _NON_ALNUM_RE.sub("", (value or "").strip().lower())
 
 
 def canonical_entity_id(
@@ -49,6 +66,10 @@ def canonical_entity_id(
         return str(uuid.uuid5(_ENTITY_NAMESPACE, key))
 
     norm = (normalized_value or "").strip().lower()
+    if etype in _IDENTIFIER_DEDUPE_TYPES:
+        # Punctuation/spacing in a document number is formatting, not identity.
+        # Fall back to the raw form if stripping leaves nothing (e.g. an all-symbol value).
+        norm = normalize_identifier(norm) or norm
     if etype in _GLOBAL_DEDUPE_TYPES:
         key = f"{etype}::{norm}"
     else:
