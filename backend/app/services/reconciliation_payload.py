@@ -356,16 +356,18 @@ def _contradictions_to_rows(contradictions: list[dict]) -> list[EntityConflictRo
         v2 = str(c.get("value2") or c.get("norm2") or "").strip()
         if not d1 or not d2 or d1 == d2:
             continue
-        # Dedupe on the NUMERIC pair, unordered, plus the reason. Surface forms of the
-        # same figure ("EGP 176,700" vs "EGP 176,700.00") and the mirrored (a,b)/(b,a)
-        # direction otherwise produce several rows for one logical conflict.
+        # Dedupe on the NUMERIC pair plus the reason, deliberately WITHOUT the document
+        # pair. The same two figures often appear in three documents, producing three
+        # pairings (A-B, A-C, B-C) of one logical conflict; a reviewer needs to see it
+        # once. Surface-form variants ("EGP 176,700" vs "EGP 176,700.00") and the
+        # mirrored (a,b)/(b,a) direction collapse here too.
         p1 = parse_monetary_amount(v1)
         p2 = parse_monetary_amount(v2)
         num_key = frozenset({
             round(p1, 2) if p1 is not None else v1.lower(),
             round(p2, 2) if p2 is not None else v2.lower(),
         })
-        key = (frozenset({d1, d2}), num_key, str(c.get("comparison_reason") or ""))
+        key = (num_key, str(c.get("comparison_reason") or ""))
         if key in seen:
             continue
         seen.add(key)

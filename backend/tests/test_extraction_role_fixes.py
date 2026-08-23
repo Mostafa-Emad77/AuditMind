@@ -308,3 +308,80 @@ class TestHeuristicClassification:
             "Transaction register. Debit Credit Balance. Opening balance. Closing balance."
         )
         assert self._classify(text, "bank_statement_Q1_2025.pdf") == "bank_statement"
+
+
+# ── Role filter must be applied before LIMIT ─────────────────────────────────
+
+class TestRoleFilterAppliedInQuery:
+    """
+    The role allow-list was applied only in Python, after the query's ORDER BY/LIMIT.
+    High-materiality but incomparable pairs therefore consumed the row budget and
+    silently pushed genuine findings (e.g. contract 200,000 vs invoice's stated
+    180,000) out of the result set entirely.
+    """
+
+    def _captured_cypher(self, monkeypatch) -> str:
+        import app.services.graph_builder as gb
+        captured = {}
+
+        class _FakeSession:
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+            def run(self, query, **kwargs):
+                captured["query"] = query
+                captured["params"] = kwargs
+                return []
+
+        class _FakeDriver:
+            def session(self, **kwargs): return _FakeSession()
+
+        monkeypatch.setattr(gb, "_run_with_reconnect", lambda fn: fn(_FakeDriver()))
+        gb.find_contradictions(["d1", "d2"])
+        return captured["query"], captured["params"]
+
+    def test_allow_list_is_filtered_in_cypher_before_limit(self, monkeypatch):
+        query, _params = self._captured_cypher(monkeypatch)
+        # Strip // comments first: prose explaining the ordering mentions "ORDER BY"
+        # and would otherwise be matched instead of the clause itself.
+        code = "\n".join(
+            line for line in query.splitlines() if not line.strip().startswith("//")
+        )
+        assert "$comparable_pairs" in code
+        assert code.index("$comparable_pairs") < code.index("ORDER BY")
+        assert code.index("$comparable_pairs") < code.index("LIMIT")
+
+    def test_cypher_pair_keys_match_the_python_allow_list(self, monkeypatch):
+        """The two implementations of the rule must not drift apart."""
+        from app.services.graph_builder import _COMPARABLE_PAIR_KEYS, _role_pair_reason
+        _, params = self._captured_cypher(monkeypatch)
+        assert params["comparable_pairs"] == _COMPARABLE_PAIR_KEYS
+        for key in _COMPARABLE_PAIR_KEYS:
+            a, b = key.split("|")
+            assert _role_pair_reason(a, b) is not None, key
+
+
+class TestConflictRowDedup:
+    def test_same_values_across_document_pairs_collapse(self):
+        """One logical conflict appearing in three doc pairings must render once."""
+        contradictions = [
+            {"doc1_id": "a", "doc2_id": "b", "value1": "EGP 176,700", "value2": "EGP 155,000",
+             "comparison_reason": "invoice total vs invoice subtotal (VAT reconciliation)"},
+            {"doc1_id": "a", "doc2_id": "c", "value1": "EGP 176,700.00", "value2": "EGP 155,000",
+             "comparison_reason": "invoice total vs invoice subtotal (VAT reconciliation)"},
+            {"doc1_id": "b", "doc2_id": "c", "value1": "EGP 155,000", "value2": "EGP 176,700",
+             "comparison_reason": "invoice total vs invoice subtotal (VAT reconciliation)"},
+        ]
+        rows = rp._contradictions_to_rows(contradictions)
+        assert len(rows) == 1
+
+    def test_different_value_pairs_are_kept_separately(self):
+        """200k-vs-180k and 200k-vs-150k are distinct findings, not duplicates."""
+        reason = "contract total vs invoice's stated contract reference"
+        contradictions = [
+            {"doc1_id": "a", "doc2_id": "b", "value1": "EGP 200,000", "value2": "EGP 180,000",
+             "comparison_reason": reason},
+            {"doc1_id": "a", "doc2_id": "c", "value1": "EGP 200,000", "value2": "EGP 150,000",
+             "comparison_reason": reason},
+        ]
+        rows = rp._contradictions_to_rows(contradictions)
+        assert len(rows) == 2

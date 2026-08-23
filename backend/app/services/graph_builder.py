@@ -335,6 +335,22 @@ _INCOMPATIBLE_ROLES: frozenset[str] = frozenset({
 })
 
 
+def _role_pair_key(role1: str, role2: str) -> str:
+    """Order-independent "a|b" key for a role pair, matching _COMPARABLE_PAIR_KEYS."""
+    a, b = sorted((role1, role2))
+    return f"{a}|{b}"
+
+
+# The allow-list flattened into sortable string keys so the SAME rule can be applied
+# inside Cypher. This matters because LIMIT runs in the database: filtering roles only
+# in Python let high-materiality but incomparable pairs consume the row budget and
+# push genuine findings out of the result set entirely.
+_COMPARABLE_PAIR_KEYS: list[str] = sorted({
+    _role_pair_key(*(tuple(pair) * 2 if len(pair) == 1 else tuple(pair)))
+    for pair in _COMPARABLE_ROLE_REASONS
+})
+
+
 def _role_pair_reason(role1: str, role2: str) -> str | None:
     """Return the human-readable reason two roles are comparable, or None if they aren't."""
     r1 = (role1 or "unknown").strip().lower()
@@ -388,6 +404,14 @@ def find_contradictions(doc_ids: list[str]) -> list[dict]:
                   // transaction values — excluded here so they never reach the LLM.
                   AND NOT coalesce(e1.amount_role, 'unknown') IN $excluded_roles
                   AND NOT coalesce(e2.amount_role, 'unknown') IN $excluded_roles
+                  // Apply the role allow-list HERE, before ORDER BY/LIMIT. Filtering it
+                  // only in Python let incomparable pairs occupy the LIMIT budget and
+                  // silently drop real findings that ranked below them.
+                  AND (CASE
+                        WHEN coalesce(e1.amount_role, 'unknown') < coalesce(e2.amount_role, 'unknown')
+                          THEN coalesce(e1.amount_role, 'unknown') + '|' + coalesce(e2.amount_role, 'unknown')
+                          ELSE coalesce(e2.amount_role, 'unknown') + '|' + coalesce(e1.amount_role, 'unknown')
+                      END) IN $comparable_pairs
                   // Currency must match when both are known (USD vs EGP is not a contradiction).
                   AND (
                        e1.amount_currency IS NULL
@@ -443,6 +467,7 @@ def find_contradictions(doc_ids: list[str]) -> list[dict]:
                 """,
                 doc_ids=doc_ids,
                 excluded_roles=sorted(_INCOMPATIBLE_ROLES),
+                comparable_pairs=_COMPARABLE_PAIR_KEYS,
             )
             return [dict(r) for r in result]
 
