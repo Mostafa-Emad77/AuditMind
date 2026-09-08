@@ -28,53 +28,35 @@ Upload invoices, contracts, bank statements, or balance sheets (scanned or digit
 ## Architecture
 
 ```mermaid
-flowchart TD
+flowchart LR
     PDFs[PDF Documents] --> Ingestion
 
-    subgraph Ingestion[Ingestion · ThreadPool sized to cpu_count]
-        OCR[PyMuPDF / EasyOCR / ArabicOCR] --> ChunkEmbed[Chunk 800/150 · Embed te3-small 1536-d]
+    subgraph Ingestion[Ingestion · ThreadPool]
+        OCR[PyMuPDF / EasyOCR / ArabicOCR] --> ChunkEmbed[Chunk 800/150 · Embed 1536-d]
     end
 
-    subgraph Compose[Docker Compose]
-        Qdrant[(Qdrant\nVectors)]
-        Redis[(Redis\nsessions · reports · chat · triage · 7d TTL)]
-        FastAPI[FastAPI · SSE stream]
-        NextUI[Next.js UI]
-    end
-
-    subgraph External[External services]
-        Neo4j[(Neo4j\nGraph · Aura)]
-        LLM[[OpenRouter / Gemini\nLLM + embeddings]]
-    end
+    Ingestion --> Qdrant[(Qdrant\nVectors)]
+    Ingestion --> Extraction
 
     subgraph Pipeline[LangGraph · background asyncio.Task]
         Extraction[Extraction\nretrieve + NER] --> Planner[Planner\nchecklist]
-        Planner --> P1[Cross-checker 1 · Graph pairs\n+ LLM adjudication]
-        P1 --> P1c[1c · Reference restatement check]
-        P1c --> P1b[1b · Signatory authority]
-        P1b --> P2[2 · Checklist × hybrid RAG]
-        P2 --> P3[3 · Dedup + UUID guard]
-        P3 --> ReportWriter[Report Writer\nbilingual + reconciliation]
+        Planner --> CrossChecker[Cross-checker\n1 graph pairs · 1c reference · 1b signatory\n2 checklist × RAG · 3 dedup]
+        CrossChecker --> ReportWriter[Report Writer\nbilingual + reconciliation]
     end
 
-    ChunkEmbed --> Qdrant
-    ChunkEmbed --> Extraction
     Qdrant --> Extraction
-    Extraction --> Neo4j
-    Neo4j --> P1
-    Neo4j --> P1c
-    Neo4j --> P1b
-    Qdrant --> P2
+    Extraction --> Neo4j[(Neo4j\nGraph · external)]
+    Neo4j --> CrossChecker
+    Qdrant --> CrossChecker
 
-    LLM -.-> Extraction
-    LLM -.-> P1
-    LLM -.-> P2
-    LLM -.-> ReportWriter
-
-    ReportWriter --> Redis
-    ReportWriter --> FastAPI
-    FastAPI --> NextUI
+    ReportWriter --> Redis[(Redis\nsessions · chat · 7d TTL)]
+    ReportWriter --> FastAPI[FastAPI · SSE]
+    FastAPI --> NextUI[Next.js UI]
     NextUI -->|Q&A / triage| FastAPI
+
+    LLM[[OpenRouter / Gemini]] -.-> Extraction
+    LLM -.-> CrossChecker
+    LLM -.-> ReportWriter
 
     style Qdrant fill:#4a6fa5,color:#fff
     style Neo4j fill:#2a6b4a,color:#fff
