@@ -5,21 +5,15 @@ from typing import Optional
 
 
 class Settings(BaseSettings):
-    # LLM provider: "openrouter" (default) or "google"
-    llm_provider: str = Field(
-        default="openrouter",
-        description="Which LLM backend to use: 'openrouter' or 'google'",
-    )
-
-    # LLM — OpenRouter
+    # LLM — OpenRouter (OpenAI-compatible)
     openrouter_api_key: str = Field(default="")
     openrouter_base_url: str = Field(default="https://openrouter.ai/api/v1")
     openrouter_model: str = Field(
-        default="openai/gpt-oss-20b:nitro",
+        default="tencent/hy4-preview",
         description="Any model slug from https://openrouter.ai/models",
     )
     openrouter_model_ner_arabic: str = Field(
-        default="qwen/qwen3-32b",
+        default="google/gemini-2.5-flash-lite",
         description="NER / entity extraction only; never substituted by OPENROUTER_MODEL",
     )
     openrouter_model_relation: str = Field(
@@ -37,21 +31,6 @@ class Settings(BaseSettings):
             "precision-critical stage, and some models (minimax-m2.5) reject a request "
             "that tries to disable it."
         ),
-    )
-
-    # LLM — Google AI Studio (Gemini)
-    google_api_key: str = Field(default="", description="Google AI Studio API key")
-    google_model: str = Field(
-        default="gemini-2.5-pro",
-        description="Default Gemini model for general / planning / report tasks",
-    )
-    google_model_ner_arabic: str = Field(
-        default="gemini-2.5-pro",
-        description="Gemini model used for NER / entity extraction",
-    )
-    google_model_relation: str = Field(
-        default="gemini-2.5-pro",
-        description="Gemini model used for cross-checker / contradiction logic",
     )
 
     @field_validator("openrouter_model_ner_arabic", "openrouter_model_relation", mode="before")

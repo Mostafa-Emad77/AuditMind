@@ -5,44 +5,19 @@ from langchain_core.language_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 from app.config import get_settings
 
-OpenRouterRole = Literal["ner_arabic", "relation"]
-
-
-def _get_google_llm(role: OpenRouterRole | None, temperature: float) -> BaseChatModel:
-    """Return a ChatGoogleGenerativeAI instance for Google AI Studio."""
-    from langchain_google_genai import ChatGoogleGenerativeAI
-
-    settings = get_settings()
-
-    if role == "ner_arabic":
-        model = settings.google_model_ner_arabic
-    elif role == "relation":
-        model = settings.google_model_relation
-    else:
-        model = settings.google_model
-
-    return ChatGoogleGenerativeAI(
-        model=model,
-        google_api_key=settings.google_api_key,
-        temperature=temperature,
-        timeout=settings.llm_timeout_seconds,
-        max_retries=settings.llm_max_retries,
-    )
+ModelRole = Literal["ner_arabic", "relation"]
 
 
 @lru_cache(maxsize=None)
 def get_llm(
     temperature: float = 0.0,
-    role: OpenRouterRole | None = None,
+    role: ModelRole | None = None,
 ) -> BaseChatModel:
-    """Configured chat model, cached per (temperature, role).
+    """Configured chat model (OpenRouter, OpenAI-compatible), cached per (temperature, role).
 
     role: ner_arabic → extraction model; relation → cross-checker model; None → general.
     """
     settings = get_settings()
-
-    if settings.llm_provider == "google":
-        return _get_google_llm(role=role, temperature=temperature)
 
     if role == "ner_arabic":
         model = settings.openrouter_model_ner_arabic

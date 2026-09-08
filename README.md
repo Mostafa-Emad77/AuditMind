@@ -55,7 +55,7 @@ flowchart LR
     FastAPI --> NextUI[Next.js UI]
     NextUI -->|Q&A / triage| FastAPI
 
-    LLM[[LLM provider\nOpenRouter default / Gemini]] -. prompts .-> Extraction
+    LLM[[LLM provider\nOpenRouter]] -. prompts .-> Extraction
     LLM -. prompts .-> CrossChecker
     LLM -. prompts .-> ReportWriter
 
@@ -78,7 +78,7 @@ flowchart LR
 | Layer | Technology |
 |-------|------------|
 | Agents | LangGraph 0.2 (`StateGraph`) |
-| LLM | [OpenRouter](https://openrouter.ai/) (default) or [Google AI Studio](https://aistudio.google.com/) (Gemini) — set `LLM_PROVIDER` |
+| LLM | [OpenRouter](https://openrouter.ai/) |
 | Embeddings | `openai/text-embedding-3-small` via OpenRouter (1536-dim) |
 | OCR | EasyOCR (multilingual), ArabicOCR fallback (Python <3.12), PyMuPDF for digital PDFs |
 | Vector DB | Qdrant |
@@ -96,7 +96,7 @@ flowchart LR
 - **Node.js 20+**  
 - **Docker** with Compose v2 (`docker compose`)  
 - **Neo4j** reachable from the backend (Aura free tier works)  
-- **OpenRouter API key** — or a **Google AI Studio API key** if you set `LLM_PROVIDER=google`  
+- **OpenRouter API key** (https://openrouter.ai/keys)  
 
 ---
 
@@ -107,7 +107,7 @@ flowchart LR
 ```bash
 cd backend
 cp .env.example .env
-# Edit .env: OPENROUTER_API_KEY (or GOOGLE_API_KEY), NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, etc.
+# Edit .env: OPENROUTER_API_KEY, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, etc.
 ```
 
 With **Docker Compose**, `QDRANT_URL` and `REDIS_URL` are overridden for the backend container. On your **host**, keep `QDRANT_URL=http://localhost:6333` and `REDIS_URL=redis://localhost:6379` when running Uvicorn outside Compose.
@@ -195,18 +195,13 @@ Settings are loaded from `backend/.env` and validated by `app/config.py` (Pydant
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `LLM_PROVIDER` | `openrouter` | `openrouter` or `google` — selects the LLM backend |
-| `OPENROUTER_API_KEY` | — | Required when `LLM_PROVIDER=openrouter` |
+| `OPENROUTER_API_KEY` | — | Required — LLM API key |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter API base URL |
-| `OPENROUTER_MODEL` | `openai/gpt-oss-20b:nitro` | General: planner, report writer, document classification, graph-entity extraction |
-| `OPENROUTER_MODEL_NER_ARABIC` | `qwen/qwen3-32b` | Entity / NER extraction per chunk — never substituted by `OPENROUTER_MODEL` |
+| `OPENROUTER_MODEL` | `tencent/hy4-preview` | General: planner, report writer, document classification, graph-entity extraction |
+| `OPENROUTER_MODEL_NER_ARABIC` | `google/gemini-2.5-flash-lite` | Entity / NER extraction per chunk — never substituted by `OPENROUTER_MODEL` |
 | `OPENROUTER_MODEL_RELATION` | `minimax/minimax-m2.5` | Cross-checker contradiction adjudication — never substituted by `OPENROUTER_MODEL` |
 | `OPENROUTER_REASONING` | `true` | Enables reasoning payload for `OPENROUTER_MODEL` only |
 | `OPENROUTER_REASONING_RELATION` | `true` | Enables reasoning for the cross-checker model (some models reject disabling it) |
-| `GOOGLE_API_KEY` | — | Required when `LLM_PROVIDER=google` |
-| `GOOGLE_MODEL` | `gemini-2.5-pro` | General: planner, report, classification, entity extraction |
-| `GOOGLE_MODEL_NER_ARABIC` | `gemini-2.5-pro` | Gemini model for NER / entity extraction |
-| `GOOGLE_MODEL_RELATION` | `gemini-2.5-pro` | Gemini model for cross-checker / contradiction logic |
 | `NEO4J_URI` | `bolt://localhost:7687` | Graph database URI |
 | `NEO4J_USER` | `neo4j` | |
 | `NEO4J_PASSWORD` | — | |
