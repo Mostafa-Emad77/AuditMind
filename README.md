@@ -56,19 +56,14 @@ flowchart LR
     FastAPI --> NextUI[Next.js UI]
     NextUI -->|Q&A / triage| FastAPI
 
-    LLM[[LLM provider\nOpenRouter]] -. prompts .-> Extraction
-    LLM -. prompts .-> CrossChecker
-    LLM -. prompts .-> ReportWriter
-
     style Qdrant fill:#4a6fa5,color:#fff
     style Neo4j fill:#2a6b4a,color:#fff
     style Redis fill:#b36833,color:#fff
-    style LLM fill:#6b4a8a,color:#fff
     style FastAPI fill:#b33,color:#fff
     style NextUI fill:#333,color:#fff
 ```
 
-**Infra (Docker Compose):** Redis (sessions + reports + chat + triage, 7-day TTL), Qdrant, FastAPI backend, Next.js frontend. **Neo4j** is external (e.g. [Neo4j Aura](https://neo4j.com/cloud/platform/aura-graph-database/)) — configure `NEO4J_*` in `backend/.env`. The audit pipeline runs as a background `asyncio.Task` decoupled from SSE connections.
+**Infra (Docker Compose):** Redis (sessions + reports + chat + triage, 7-day TTL), Qdrant, FastAPI backend, Next.js frontend. **Neo4j** is external (e.g. [Neo4j Aura](https://neo4j.com/cloud/platform/aura-graph-database/)) — configure `NEO4J_*` in `backend/.env`. All agent nodes (Extraction, Cross-checker, Report Writer) send prompts to **OpenRouter**. The audit pipeline runs as a background `asyncio.Task` decoupled from SSE connections.
 
 **Performance:** multi-document uploads are ingested (OCR + embedding) concurrently in a thread pool sized to `os.cpu_count()`. Entity extraction runs per-document in parallel with `asyncio.gather`. Hybrid-RAG query routing and checklist-intent classification are rule-based (no per-item LLM calls). Document type classification runs the regex heuristic first and only falls back to an LLM call when it can't decide. Within the cross-checker, both adjudication phases (graph pair validation, checklist-item checks) run concurrently under a `semaphore=3` `asyncio.gather`, and every sync tool call (Neo4j, Qdrant, hybrid retrieval) is offloaded to an executor — none of it blocks the event loop or SSE keepalives. Reasoning-step ordering stays deterministic despite the concurrency via a small step-buffering scheme that replays each worker's output in original order. The Qdrant client and collection/index setup are singletons initialized once at startup rather than per request. The audit pipeline runs as a free-standing `asyncio.Task` decoupled from SSE connections — a client disconnect won't cancel the audit.
 
