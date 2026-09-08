@@ -31,28 +31,55 @@ Upload invoices, contracts, bank statements, or balance sheets (scanned or digit
 flowchart TD
     PDFs[PDF Documents] --> Ingestion
 
-    subgraph Ingestion[Ingestion]
-        OCR[EasyOCR / PyMuPDF / ArabicOCR]
-        OCR --> ChunkEmbed[Chunk & Embed]
+    subgraph Ingestion[Ingestion · ThreadPool sized to cpu_count]
+        OCR[PyMuPDF / EasyOCR / ArabicOCR] --> ChunkEmbed[Chunk 800/150 · Embed te3-small 1536-d]
     end
 
-    ChunkEmbed --> Qdrant[(Qdrant\nVectors)]
-    ChunkEmbed --> EntityExt[Entity Extraction]
-    EntityExt --> Neo4j[(Neo4j\nGraph)]
-
-    Qdrant --> Planner
-    Neo4j --> Planner
-
-    subgraph Pipeline[LangGraph Pipeline]
-        Planner[Planner\nAudit Checklist] --> CrossChecker[Cross-checker\nHybrid RAG + Graph Tools]
-        CrossChecker --> ReportWriter[Report Writer]
+    subgraph Compose[Docker Compose]
+        Qdrant[(Qdrant\nVectors)]
+        Redis[(Redis\nsessions · reports · chat · triage · 7d TTL)]
+        FastAPI[FastAPI · SSE stream]
+        NextUI[Next.js UI]
     end
 
-    ReportWriter --> FastAPI[FastAPI SSE Stream]
-    FastAPI --> NextUI[Next.js UI]
+    subgraph External[External services]
+        Neo4j[(Neo4j\nGraph · Aura)]
+        LLM[[OpenRouter / Gemini\nLLM + embeddings]]
+    end
+
+    subgraph Pipeline[LangGraph · background asyncio.Task]
+        Extraction[Extraction\nretrieve + NER] --> Planner[Planner\nchecklist]
+        Planner --> P1[Cross-checker 1 · Graph pairs\n+ LLM adjudication]
+        P1 --> P1c[1c · Reference restatement check]
+        P1c --> P1b[1b · Signatory authority]
+        P1b --> P2[2 · Checklist × hybrid RAG]
+        P2 --> P3[3 · Dedup + UUID guard]
+        P3 --> ReportWriter[Report Writer\nbilingual + reconciliation]
+    end
+
+    ChunkEmbed --> Qdrant
+    ChunkEmbed --> Extraction
+    Qdrant --> Extraction
+    Extraction --> Neo4j
+    Neo4j --> P1
+    Neo4j --> P1c
+    Neo4j --> P1b
+    Qdrant --> P2
+
+    LLM -.-> Extraction
+    LLM -.-> P1
+    LLM -.-> P2
+    LLM -.-> ReportWriter
+
+    ReportWriter --> Redis
+    ReportWriter --> FastAPI
+    FastAPI --> NextUI
+    NextUI -->|Q&A / triage| FastAPI
 
     style Qdrant fill:#4a6fa5,color:#fff
     style Neo4j fill:#2a6b4a,color:#fff
+    style Redis fill:#b36833,color:#fff
+    style LLM fill:#6b4a8a,color:#fff
     style FastAPI fill:#b33,color:#fff
     style NextUI fill:#333,color:#fff
 ```
@@ -190,8 +217,9 @@ Settings are loaded from `backend/.env` and validated by `app/config.py` (Pydant
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter API base URL |
 | `OPENROUTER_MODEL` | `openai/gpt-oss-20b:nitro` | General: planner, report writer, document classification, graph-entity extraction |
 | `OPENROUTER_MODEL_NER_ARABIC` | `qwen/qwen3-32b` | Entity / NER extraction per chunk — never substituted by `OPENROUTER_MODEL` |
-| `OPENROUTER_MODEL_RELATION` | `anthropic/claude-sonnet-4.6` | Cross-checker contradiction adjudication — never substituted by `OPENROUTER_MODEL` |
+| `OPENROUTER_MODEL_RELATION` | `minimax/minimax-m2.5` | Cross-checker contradiction adjudication — never substituted by `OPENROUTER_MODEL` |
 | `OPENROUTER_REASONING` | `true` | Enables reasoning payload for `OPENROUTER_MODEL` only |
+| `OPENROUTER_REASONING_RELATION` | `true` | Enables reasoning for the cross-checker model (some models reject disabling it) |
 | `GOOGLE_API_KEY` | — | Required when `LLM_PROVIDER=google` |
 | `GOOGLE_MODEL` | `gemini-2.5-pro` | General: planner, report, classification, entity extraction |
 | `GOOGLE_MODEL_NER_ARABIC` | `gemini-2.5-pro` | Gemini model for NER / entity extraction |
