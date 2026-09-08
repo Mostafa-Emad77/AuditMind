@@ -267,6 +267,7 @@ async def _run_audit_pipeline(audit_id: str) -> None:
         "audit_id": audit_id,
         "documents": current_session.documents,
         "checklist": [],
+        "replan_count": 0,
         "findings": [],
         "report": None,
         "reasoning_trace": [],

@@ -56,6 +56,16 @@ async def planner_agent(state: AuditState) -> dict:
                       "to the report.")
         new_steps.append(step)
 
+    # Re-plan pass: the checklist from the prior pass is already in state.
+    prior_checklist: list[ChecklistItem] = list(state.get("checklist", []) or [])
+    is_replan = len(prior_checklist) > 0
+    if is_replan:
+        step = _emit(writer, "thought",
+                      f"Re-plan pass: the first sweep found no contradictions with "
+                      f"{len(prior_checklist)} checks. I'll generate deeper follow-up "
+                      f"checks and drop anything already covered.")
+        new_steps.append(step)
+
     # Determine what pairs/combinations exist and explain reasoning
     reasoning_parts = []
     if "invoice" in doc_types and "contract" in doc_types:
@@ -119,6 +129,16 @@ async def planner_agent(state: AuditState) -> dict:
         checklist_preview = "\n".join(
             f"  [{c.priority.upper()}] {c.description}" for c in checklist[:8]
         )
+        if is_replan:
+            seen = {c.description.strip().lower() for c in prior_checklist}
+            fresh = [c for c in checklist if c.description.strip().lower() not in seen]
+            step = _emit(writer, "thought",
+                         f"Re-plan: {len(fresh)} new checks added"
+                         + (f" ({len(checklist) - len(fresh)} duplicates of prior checks dropped)."
+                            if len(fresh) < len(checklist) else "."))
+            new_steps.append(step)
+            checklist = [*prior_checklist, *fresh]
+
         step = _emit(writer, "summary",
                      f"Audit plan ready. {len(high_priority)} high-priority checks, "
                      f"{len(checklist) - len(high_priority)} standard checks.\n\n"
@@ -129,6 +149,7 @@ async def planner_agent(state: AuditState) -> dict:
         return {
             "messages": [AIMessage(content=f"Audit checklist generated: {len(checklist)} items.")],
             "checklist": checklist,
+            "replan_count": 1,
             "reasoning_trace": new_steps,
         }
 
@@ -152,8 +173,15 @@ async def planner_agent(state: AuditState) -> dict:
                 priority="medium",
             ),
         ]
+        if is_replan:
+            seen = {c.description.strip().lower() for c in prior_checklist}
+            fallback = [c for c in fallback if c.description.strip().lower() not in seen]
+            checklist = [*prior_checklist, *fallback]
+        else:
+            checklist = fallback
         return {
             "messages": [AIMessage(content="Using fallback checklist due to error.")],
-            "checklist": fallback,
+            "checklist": checklist,
+            "replan_count": 1,
             "reasoning_trace": new_steps,
         }

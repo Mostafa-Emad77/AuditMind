@@ -43,6 +43,7 @@ flowchart LR
         Planner -->|≥2 docs| CrossChecker[Cross-checker\n1 graph pairs · 1c reference · 1b signatory\n2 checklist × RAG · 3 dedup]
         Planner -->|1 doc · skip| ReportWriter[Report Writer\nbilingual + reconciliation]
         CrossChecker --> ReportWriter
+        CrossChecker -->|empty findings + thin plan · 1 retry| Planner
     end
 
     Qdrant --> Extraction

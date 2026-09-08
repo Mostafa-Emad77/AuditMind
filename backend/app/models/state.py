@@ -26,6 +26,9 @@ class AuditState(TypedDict):
     # Planner output
     checklist: list[ChecklistItem]
 
+    # Re-plan loop counter (planner increments each pass; router caps total passes)
+    replan_count: Annotated[int, lambda a, b: a + b]
+
     # Cross-Checker output
     findings: list[Finding]
 
