@@ -29,8 +29,5 @@ Pillow==11.1.0
 # Better multilingual OCR (Arabic + English), used before arabicOcr/tesseract.
 easyocr
 
-# NLP / Embeddings
-sentence-transformers==3.4.1
-
 # Redis session store
 redis==5.2.1

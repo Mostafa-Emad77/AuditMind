@@ -57,21 +57,6 @@ class _OpenRouterEmbedder(_Embedder):
         return self._client.embed_documents([t if t.strip() else " " for t in texts])
 
 
-class _LocalEmbedder(_Embedder):
-    """SentenceTransformer fallback (EMBEDDING_PROVIDER=local)."""
-
-    def __init__(self, model: str) -> None:
-        from sentence_transformers import SentenceTransformer  # heavy; import lazily
-
-        self._model = SentenceTransformer(model)
-        self.dimension = int(self._model.get_sentence_embedding_dimension())
-
-    def encode(self, texts: list[str]) -> list[list[float]]:
-        if not texts:
-            return []
-        return self._model.encode(texts, batch_size=32, show_progress_bar=False).tolist()
-
-
 _encoder: Optional[_Embedder] = None
 _client: Optional[QdrantClient] = None
 _collection_ready: Optional[str] = None
@@ -81,18 +66,15 @@ def get_encoder() -> _Embedder:
     global _encoder
     if _encoder is None:
         settings = get_settings()
-        if settings.embedding_provider == "openrouter":
-            _encoder = _OpenRouterEmbedder(
-                model=settings.embedding_model,
-                dimension=settings.embedding_dimension,
-                api_key=settings.openrouter_api_key,
-                base_url=settings.openrouter_base_url,
-            )
-        else:
-            _encoder = _LocalEmbedder(settings.embedding_model)
+        _encoder = _OpenRouterEmbedder(
+            model=settings.embedding_model,
+            dimension=settings.embedding_dimension,
+            api_key=settings.openrouter_api_key,
+            base_url=settings.openrouter_base_url,
+        )
         logger.info(
-            "Embeddings: provider=%s model=%s dim=%d",
-            settings.embedding_provider, settings.embedding_model, _encoder.dimension,
+            "Embeddings: model=%s dim=%d",
+            settings.embedding_model, _encoder.dimension,
         )
     return _encoder
 
@@ -109,7 +91,7 @@ def get_qdrant_client() -> QdrantClient:
     return _client
 
 
-def ensure_collection(client: QdrantClient, collection_name: str, vector_size: int = 768) -> None:
+def ensure_collection(client: QdrantClient, collection_name: str, vector_size: int = 1536) -> None:
     """Create the collection + payload indexes once per process."""
     global _collection_ready
     if _collection_ready == collection_name:

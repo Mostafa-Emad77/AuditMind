@@ -11,7 +11,7 @@ AuditMind analyzes financial PDFs in Arabic and English, cross-checks them with 
 Upload invoices, contracts, bank statements, or balance sheets (scanned or digital). AuditMind:
 
 1. **Extracts** text — PyMuPDF for digital PDFs; EasyOCR (multilingual) + ArabicOCR fallback for scans  
-2. **Embeds** chunks into **Qdrant** (sentence-transformers, 768-dim) and builds an entity graph in **Neo4j**  
+2. **Embeds** chunks into **Qdrant** (`openai/text-embedding-3-small` via OpenRouter, 1536-dim) and builds an entity graph in **Neo4j**  
 3. **Plans** a targeted audit checklist from the detected document types  
 4. **Cross-checks** across documents — 4-phase: graph contradiction detection → LLM adjudication → checklist-driven semantic retrieval → deduplication, all orchestrated via a dedicated `cross_checker` package  
 5. **Surfaces contradictions** (amount mismatches, date inconsistencies, party discrepancies) with severity and confidence  
@@ -69,7 +69,7 @@ flowchart TD
 |-------|------------|
 | Agents | LangGraph 0.2 (`StateGraph`) |
 | LLM | [OpenRouter](https://openrouter.ai/) (default) or [Google AI Studio](https://aistudio.google.com/) (Gemini) — set `LLM_PROVIDER` |
-| Embeddings | `openai/text-embedding-3-small` via OpenRouter (1536-dim) — or a local SentenceTransformer with `EMBEDDING_PROVIDER=local` |
+| Embeddings | `openai/text-embedding-3-small` via OpenRouter (1536-dim) |
 | OCR | EasyOCR (multilingual), ArabicOCR fallback (Python <3.12), PyMuPDF for digital PDFs |
 | Vector DB | Qdrant |
 | Graph DB | Neo4j (Aura or self-hosted) |
@@ -204,9 +204,8 @@ Settings are loaded from `backend/.env` and validated by `app/config.py` (Pydant
 | `QDRANT_API_KEY` | — | Required for Qdrant Cloud |
 | `QDRANT_COLLECTION` | `auditmind_docs` | Qdrant collection name |
 | `REDIS_URL` | `redis://localhost:6379` | Session, report, chat, and triage storage (7-day TTL) |
-| `EMBEDDING_PROVIDER` | `openrouter` | `openrouter` (OpenAI-compatible `/embeddings`, uses `OPENROUTER_API_KEY`) or `local` (SentenceTransformer) |
-| `EMBEDDING_MODEL` | `openai/text-embedding-3-small` | OpenRouter slug, or a SentenceTransformer name when `EMBEDDING_PROVIDER=local` |
-| `EMBEDDING_DIMENSION` | `1536` | Vector size for the `openrouter` provider (local models report their own). Changing models requires a new `QDRANT_COLLECTION` |
+| `EMBEDDING_MODEL` | `openai/text-embedding-3-small` | OpenRouter slug (OpenAI-compatible `/embeddings`, uses `OPENROUTER_API_KEY`) |
+| `EMBEDDING_DIMENSION` | `1536` | Vector size of the embedding model. Changing models requires a new `QDRANT_COLLECTION` |
 | `EXTRACTION_CONCURRENCY` | `3` | Parallel LLM calls inside the entity extractor; reduce to `1` on free-tier rate limits |
 | `EXTRACTION_CHUNK_SLEEP` | `0.0` | Seconds to sleep between extraction batches (e.g. `4.0` for free-tier rate limits) |
 | `EXTRACTION_TOP_K_BASE` | `50` | Base `top_k` for extraction queries on small docs (≤5 pages) |

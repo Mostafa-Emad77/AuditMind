@@ -1,7 +1,7 @@
 from pydantic_settings import BaseSettings
 from pydantic import Field, field_validator
 from functools import lru_cache
-from typing import Literal, Optional
+from typing import Optional
 
 
 class Settings(BaseSettings):
@@ -75,15 +75,11 @@ class Settings(BaseSettings):
         description="Neo4j database name (Aura default is usually 'neo4j')",
     )
 
-    # Embeddings
-    embedding_provider: Literal["openrouter", "local"] = Field(
-        default="openrouter",
-        description="openrouter (OpenAI-compatible /embeddings) or local (SentenceTransformer)",
-    )
+    # Embeddings (OpenAI-compatible /embeddings via OpenRouter, uses OPENROUTER_API_KEY)
     embedding_model: str = Field(default="openai/text-embedding-3-small")
     embedding_dimension: int = Field(
         default=1536,
-        description="Vector size for the openrouter provider (local models report their own).",
+        description="Vector size of the embedding model.",
     )
 
     # Redis
