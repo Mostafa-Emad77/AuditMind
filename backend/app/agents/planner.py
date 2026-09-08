@@ -49,6 +49,13 @@ async def planner_agent(state: AuditState) -> dict:
                  f"Languages: {', '.join(set(doc.language for doc in documents))}.")
     new_steps.append(step)
 
+    if len(documents) < 2:
+        step = _emit(writer, "thought",
+                      "Single-document audit — there is nothing to cross-check against, "
+                      "so the cross-checker phase will be skipped and I'll go straight "
+                      "to the report.")
+        new_steps.append(step)
+
     # Determine what pairs/combinations exist and explain reasoning
     reasoning_parts = []
     if "invoice" in doc_types and "contract" in doc_types:
