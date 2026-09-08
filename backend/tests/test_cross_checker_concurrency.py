@@ -1,9 +1,4 @@
-"""Tests for Phase 3.1/3.2: executor offload and parallel adjudication.
-
-The risk these guard is not speed but ordering — the Phase-3 dedup loop is
-order-sensitive, so concurrent workers must still produce a checklist-ordered
-finding list and reasoning trace.
-"""
+"""Executor offload and parallel adjudication must preserve checklist order."""
 import asyncio
 import json
 
@@ -56,6 +51,8 @@ def wired(monkeypatch):
         _StubTool({"results": [], "vector_count": 0, "graph_count": 0}),
     )
     monkeypatch.setattr(cc, "get_all_chunks_for_docs", lambda _ids: [])
+    # Keep the suite hermetic: without this the signatory phase would hit live Neo4j.
+    monkeypatch.setattr(cc, "find_signatory_mismatches", lambda _ids: [])
 
     async def _no_suppression(_key):
         return set()

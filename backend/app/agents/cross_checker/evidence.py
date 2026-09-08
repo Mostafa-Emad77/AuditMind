@@ -1,7 +1,6 @@
 """Pure helper functions for evidence analysis — no heavy service imports."""
 from typing import Any
 
-from langgraph.config import get_stream_writer
 
 from app.models.schemas import ReasoningStep
 from app.utils.arabic_normalizer import extract_amounts

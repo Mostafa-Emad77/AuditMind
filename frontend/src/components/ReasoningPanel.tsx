@@ -23,14 +23,17 @@ interface ReasoningPanelProps {
 }
 
 export function ReasoningPanel({ steps, agentStatuses, isRunning, isComplete }: ReasoningPanelProps) {
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const feedRef = useRef<HTMLElement>(null);
   const prevLengthRef = useRef(0);
 
   useEffect(() => {
-    if (steps.length > prevLengthRef.current) {
-      prevLengthRef.current = steps.length;
-      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-    }
+    if (steps.length <= prevLengthRef.current) return;
+    prevLengthRef.current = steps.length;
+    const feed = feedRef.current;
+    if (!feed) return;
+    // scrollIntoView() would scroll every ancestor including the window; scroll
+    // this pane only.
+    feed.scrollTo({ top: feed.scrollHeight, behavior: "smooth" });
   }, [steps.length]);
 
   const visibleSteps = useMemo(() => steps.slice(-20), [steps]);
@@ -38,7 +41,7 @@ export function ReasoningPanel({ steps, agentStatuses, isRunning, isComplete }: 
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="px-5 pt-6 pb-4 flex flex-col gap-1.5">
+      <div className="px-5 pt-6 pb-4 flex flex-col gap-1.5 shrink-0">
         <div className="flex items-center gap-2.5">
           {isRunning && (
             <div className="w-2 h-2 rounded-full bg-primary animate-pulse" />
@@ -54,8 +57,8 @@ export function ReasoningPanel({ steps, agentStatuses, isRunning, isComplete }: 
         <span className="text-xs text-muted-foreground">AI Agent Activity</span>
       </div>
 
-      {/* Agent pipeline nav */}
-      <nav className="flex flex-col gap-0.5 flex-1 px-2 overflow-y-auto">
+      {/* min-h-0: lets this pane scroll independently instead of growing the page. */}
+      <nav ref={feedRef} className="flex flex-col gap-0.5 flex-1 min-h-0 px-2 overflow-y-auto">
         {AGENT_ORDER.map((agent) => {
           const status = agentStatuses[agent];
           const isActive = status === "active";
@@ -137,8 +140,6 @@ export function ReasoningPanel({ steps, agentStatuses, isRunning, isComplete }: 
             )}
           </div>
         )}
-
-        <div ref={bottomRef} />
       </nav>
     </div>
   );

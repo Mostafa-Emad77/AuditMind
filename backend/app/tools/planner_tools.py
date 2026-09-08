@@ -14,8 +14,20 @@ _VALID_CHECK_TYPES = {
     "clause_completeness",
     "signature_check",
     "cross_doc_consistency",
+    "self_reference",
     "other",
 }
+
+# Guaranteed on multi-document audits; evaluated deterministically in Phase 1c.
+_SELF_REFERENCE_ITEM = dict(
+    description=(
+        "Cross-document self-reference validation: compare every value a document "
+        "claims about another document (e.g. an invoice stating the contract value) "
+        "against that referenced document's actual stated value"
+    ),
+    check_type="self_reference",
+    priority="high",
+)
 _VALID_PRIORITIES = {"high", "medium", "low"}
 
 
@@ -196,7 +208,7 @@ def _generate_checklist_llm(doc_types: list[str], doc_ids: list[str]) -> list[di
         '  "checklist": [\n'
         "    {\n"
         '      "description": "string",\n'
-        '      "check_type": "amount_match|date_consistency|party_match|clause_completeness|signature_check|cross_doc_consistency|other",\n'
+        '      "check_type": "amount_match|date_consistency|party_match|clause_completeness|signature_check|cross_doc_consistency|self_reference|other",\n'
         '      "priority": "high|medium|low"\n'
         "    }\n"
         "  ]\n"
@@ -207,9 +219,12 @@ def _generate_checklist_llm(doc_types: list[str], doc_ids: list[str]) -> list[di
         "- If bank_statement+contract exist, include total paid vs contract total and milestone-vs-payment checks.\n"
         "- If bank_statement+invoice exist, include total paid vs invoice total check.\n"
         "- If all three exist, include missing invoice coverage for paid periods/milestones.\n"
-        "- Include 6-12 checks total.\n\n"
+        "- Include 6-12 checks total.\n"
+        "- Describe checks generically by document TYPE (e.g. \"the contract\", \"the bank statement\"). "
+        "Do NOT invent or cite specific contract numbers, invoice numbers, or document IDs — you have "
+        "not seen the document contents, only their types.\n\n"
+        # doc_ids deliberately omitted: the model echoed the UUIDs as fake contract numbers.
         f"doc_types: {json.dumps(doc_types)}\n"
-        f"doc_ids: {json.dumps(doc_ids)}\n"
     )
     resp = llm.invoke(prompt)
     content = normalize_llm_content(resp)
@@ -246,18 +261,7 @@ def _generate_checklist_llm(doc_types: list[str], doc_ids: list[str]) -> list[di
 
 @tool
 def generate_checklist(doc_types_json: str, doc_ids_json: str) -> str:
-    """
-    Generate a custom audit checklist based on the types of documents provided.
-    This tool analyzes what document combinations are present and creates
-    targeted checks to perform.
-
-    Args:
-        doc_types_json: JSON array of document types (e.g. '["invoice", "contract"]')
-        doc_ids_json: JSON array of corresponding document IDs
-
-    Returns:
-        JSON string with a list of audit checklist items to verify
-    """
+    """Build the audit checklist for the given document types (JSON in, JSON out)."""
     try:
         doc_types = json.loads(doc_types_json)
         doc_ids = json.loads(doc_ids_json)
@@ -270,6 +274,13 @@ def generate_checklist(doc_types_json: str, doc_ids_json: str) -> str:
         logger.warning("LLM checklist generation failed: %s", e)
     if not checklist_items:
         checklist_items = _generate_checklist_deterministic(doc_types, doc_ids)
+
+    # Self-reference check: guaranteed for ≥2 docs, meaningless for one.
+    checklist_items = [c for c in checklist_items if c.get("check_type") != "self_reference"]
+    if len(doc_ids) >= 2:
+        checklist_items.insert(
+            0, ChecklistItem(doc_ids_involved=doc_ids, **_SELF_REFERENCE_ITEM).model_dump()
+        )
 
     return json.dumps({
         "checklist": checklist_items,

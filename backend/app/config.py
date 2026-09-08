@@ -1,7 +1,7 @@
 from pydantic_settings import BaseSettings
 from pydantic import Field, field_validator
 from functools import lru_cache
-from typing import Optional
+from typing import Literal, Optional
 
 
 class Settings(BaseSettings):
@@ -68,8 +68,14 @@ class Settings(BaseSettings):
     )
 
     # Embeddings
-    embedding_model: str = Field(
-        default="sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+    embedding_provider: Literal["openrouter", "local"] = Field(
+        default="openrouter",
+        description="openrouter (OpenAI-compatible /embeddings) or local (SentenceTransformer)",
+    )
+    embedding_model: str = Field(default="openai/text-embedding-3-small")
+    embedding_dimension: int = Field(
+        default=1536,
+        description="Vector size for the openrouter provider (local models report their own).",
     )
 
     # Redis
@@ -99,11 +105,7 @@ class Settings(BaseSettings):
     )
     extraction_chunk_cap: Optional[int] = Field(
         default=None,
-        description=(
-            "Optional hard cap inside the entity extractor on top of the upstream retrieval "
-            "limit. None = no extra cap (recommended); upstream extraction_top_k_max is the "
-            "single source of truth. Set to a small int (e.g. 15) to restore legacy free-tier behaviour."
-        ),
+        description="Extra cap inside the extractor; None = rely on extraction_top_k_max",
     )
 
     # Cross-checker precision gates
@@ -138,6 +140,14 @@ class Settings(BaseSettings):
     llm_max_retries: int = Field(
         default=2, description="Max automatic retries on transient LLM call failures"
     )
+    llm_max_output_tokens: int = Field(
+        default=2048,
+        description="Cap on completion tokens per call (all prompts ask for compact JSON)",
+    )
+    retriever_llm_query_entities: bool = Field(
+        default=False,
+        description="LLM-extract graph entities per checklist query (off: regex suffices)",
+    )
 
     # Auth
     api_keys: str = Field(
@@ -150,7 +160,6 @@ class Settings(BaseSettings):
         return [k.strip() for k in self.api_keys.split(",") if k.strip()]
 
     # App
-    app_env: str = Field(default="development")
     cors_origins: str = Field(default="http://localhost:3000")
 
     @property

@@ -7,7 +7,10 @@ import uuid
 class DocumentMeta(BaseModel):
     doc_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     filename: str
-    doc_type: Literal["invoice", "contract", "balance_sheet", "bank_statement", "audit_report", "unknown"] = "unknown"
+    doc_type: Literal[
+        "invoice", "contract", "balance_sheet", "bank_statement", "audit_report",
+        "payment_certificate", "qs_report", "board_resolution", "unknown",
+    ] = "unknown"
     language: Literal["arabic", "english", "mixed", "unknown"] = "unknown"
     page_count: int = 0
     upload_time: datetime = Field(default_factory=datetime.utcnow)
@@ -36,35 +39,25 @@ AMOUNT_ROLES = Literal[
     "total_invoice",
     "invoice_subtotal",
     "invoice_line_item",
-    # An invoice RESTATING what it claims the contract total is. Deliberately
-    # distinct from total_contract_value — comparing the two is how restatement
-    # errors are caught, so they must never collapse into one role.
+    # An invoice's restatement of the contract total — kept distinct so it can be checked.
     "invoice_referenced_contract_value",
     # ── Bank-statement-side ──────────────────────────────────────────────────
     "transaction_debit",
     "transaction_credit",
-    # Statement-level summary figures — used to VALIDATE the summed transaction rows,
-    # never added to them (adding both double-counts the statement).
+    # Statement summary figures: validate the rows, never summed with them.
     "statement_total_debits",
     "statement_total_credits",
-    # Cumulative account state, NOT a transaction value. Must never be summed,
-    # compared against invoice/contract totals, or used in "total paid" math.
+    # Cumulative balances — never summed or compared to totals.
     "running_balance",
     "opening_balance",
     "closing_balance",
     # ── Other ────────────────────────────────────────────────────────────────
     "vat_tax",
     "late_fee",
-    # Legacy: pre-dates the debit/credit split. Treated as transaction_debit by
-    # reconciliation so historical graph data keeps working.
-    "single_payment",
     "unknown",
 ]
 
-# Roles that represent cumulative account state or a pre-aggregated total rather than
-# an individual transaction value. Summing any of these is always a bug — it either
-# double-counts the whole account history (balances) or double-counts the rows
-# themselves (statement totals).
+# Balances and statement totals — summing any of these double-counts.
 NON_SUMMABLE_ROLES = frozenset({
     "running_balance",
     "opening_balance",
@@ -73,9 +66,8 @@ NON_SUMMABLE_ROLES = frozenset({
     "statement_total_credits",
 })
 
-# Roles that count as money actually leaving the account. `single_payment` is the
-# pre-split legacy role and is treated as a debit for backwards compatibility.
-BANK_OUTFLOW_ROLES = frozenset({"transaction_debit", "single_payment"})
+# Roles that count as money actually leaving the account.
+BANK_OUTFLOW_ROLES = frozenset({"transaction_debit"})
 
 
 class Entity(BaseModel):
@@ -87,20 +79,20 @@ class Entity(BaseModel):
     source_page: int
     confidence: float = 1.0
     amount_role: Optional[AMOUNT_ROLES] = None
-    # Set by LLM extraction (see entity_extractor prompt); used for contradiction / graph context
+    # From LLM extraction; used for contradiction / graph context.
     source_language: Literal["arabic", "english", "mixed", "unknown"] = "unknown"
     coreference_note: Optional[str] = None
-    # Amount entities: when both digit scripts appear, LLM fills these (no regex in pipeline)
+    # Filled by the LLM when both digit scripts appear.
     western_numeral_form: Optional[str] = None
     arabic_indic_numeral_form: Optional[str] = None
     numeral_mismatch: Optional[bool] = None
-    # Deterministic numeric parse for amount entities (set by entity_extractor; never by LLM).
-    # When populated, downstream contradiction logic compares numerically with tolerance
-    # instead of doing string-equality on `normalized_value`.
+    # Deterministic numeric parse (never from the LLM); enables tolerant comparison.
     amount_value: Optional[float] = None
     amount_currency: Optional[str] = None
-    # Person / signatory entities — enables authority-mismatch findings (e.g. an
-    # amendment signed by a CFO where the original was signed by the Chairman).
+    # Bank rows only: transaction identity for dedupe (never the payee).
+    txn_ref: Optional[str] = None
+    txn_date: Optional[str] = None
+    # Signatory fields for authority-mismatch findings.
     role_title: Optional[str] = None
     signing_authority_level: Optional[
         Literal["chairman", "ceo", "cfo", "director", "manager", "other", "unknown"]
@@ -121,7 +113,13 @@ class Relationship(BaseModel):
 class ChecklistItem(BaseModel):
     item_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     description: str
-    check_type: Literal["amount_match", "date_consistency", "party_match", "clause_completeness", "signature_check", "cross_doc_consistency", "other"]
+    check_type: Literal[
+        "amount_match", "date_consistency", "party_match", "clause_completeness",
+        "signature_check", "cross_doc_consistency",
+        # A document's claim about another vs. that document's own value (deterministic).
+        "self_reference",
+        "other",
+    ]
     doc_ids_involved: list[str] = Field(default_factory=list)
     priority: Literal["high", "medium", "low"] = "medium"
 
@@ -160,7 +158,7 @@ class AuditSession(BaseModel):
     completed_at: Optional[datetime] = None
     report_language: Literal["arabic", "english"] = "english"
     error: Optional[str] = None
-    # Scope for the suppressed-findings feedback loop; "default" when API-key auth is disabled.
+    # Scope for suppressed findings; "default" without API-key auth.
     api_key: str = "default"
 
 
@@ -173,6 +171,10 @@ class ReconciliationSnapshot(BaseModel):
     bank_paid_total: Optional[float] = None
     variance_vs_contract: Optional[float] = None
     notes: Optional[str] = None
+    # Debit rows don't reconcile with stated Total Debits → bank total withheld.
+    bank_extraction_incomplete: bool = False
+    bank_debits_verified: Optional[float] = None
+    bank_debits_stated: Optional[float] = None
 
 
 class EntityConflictRow(BaseModel):
@@ -184,9 +186,7 @@ class EntityConflictRow(BaseModel):
     doc_b_id: str
     doc_b_value: str
     severity: Literal["critical", "warning"]
-    # Human-readable explanation of WHY these two values were compared, derived from
-    # the matched role pair (e.g. "contract total vs invoice's stated contract
-    # reference"). Free-form rather than an enum so the reason can be specific.
+    # Why the two values were compared (from the matched role pair).
     conflict_type: str = "amount"
     anchor_hint: Optional[str] = None
 
@@ -257,30 +257,3 @@ class ChatRequest(BaseModel):
     message: str
 
 
-class GraphNode(BaseModel):
-    id: str
-    label: str
-    node_type: str
-    doc_id: Optional[str] = None
-    mention_count: int = 1
-    degree: int = 0
-    is_center: bool = False
-    raw_ids: list[str] = Field(default_factory=list)
-    properties: dict = Field(default_factory=dict)
-
-
-class GraphEdge(BaseModel):
-    source: str
-    target: str
-    relationship: str
-    is_contradiction: bool = False
-    count: int = 1
-    show_label: Optional[bool] = None
-    properties: dict = Field(default_factory=dict)
-
-
-class GraphData(BaseModel):
-    nodes: list[GraphNode]
-    edges: list[GraphEdge]
-    center_node: Optional[str] = None
-    view: str = "canonical"

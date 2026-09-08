@@ -2,7 +2,7 @@
 import logging
 from typing import Optional
 
-from qdrant_client import QdrantClient, AsyncQdrantClient
+from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
     VectorParams,
@@ -15,29 +15,90 @@ from qdrant_client.models import (
     TextIndexParams,
     TokenizerType,
 )
-from sentence_transformers import SentenceTransformer
-
 from app.config import get_settings
 from app.models.schemas import DocumentChunk
 from app.utils.canonical_id import canonical_chunk_point_id
 
 logger = logging.getLogger(__name__)
 
-_encoder: Optional[SentenceTransformer] = None
+
+class _Embedder:
+    """Provider-agnostic embedding interface: `encode(texts)` and `.dimension`."""
+
+    dimension: int
+
+    def encode(self, texts: list[str]) -> list[list[float]]:  # pragma: no cover - interface
+        raise NotImplementedError
+
+    def encode_one(self, text: str) -> list[float]:
+        return self.encode([text])[0]
+
+
+class _OpenRouterEmbedder(_Embedder):
+    """OpenAI-compatible /embeddings via OpenRouter (e.g. openai/text-embedding-3-small)."""
+
+    def __init__(self, model: str, dimension: int, api_key: str, base_url: str) -> None:
+        from langchain_openai import OpenAIEmbeddings
+
+        self.dimension = dimension
+        self._client = OpenAIEmbeddings(
+            model=model,
+            openai_api_key=api_key,
+            openai_api_base=base_url,
+            # Send raw strings; tiktoken doesn't know OpenRouter slugs.
+            check_embedding_ctx_length=False,
+            chunk_size=64,
+        )
+
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        # API rejects empty strings.
+        return self._client.embed_documents([t if t.strip() else " " for t in texts])
+
+
+class _LocalEmbedder(_Embedder):
+    """SentenceTransformer fallback (EMBEDDING_PROVIDER=local)."""
+
+    def __init__(self, model: str) -> None:
+        from sentence_transformers import SentenceTransformer  # heavy; import lazily
+
+        self._model = SentenceTransformer(model)
+        self.dimension = int(self._model.get_sentence_embedding_dimension())
+
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        return self._model.encode(texts, batch_size=32, show_progress_bar=False).tolist()
+
+
+_encoder: Optional[_Embedder] = None
 _client: Optional[QdrantClient] = None
 _collection_ready: Optional[str] = None
 
 
-def get_encoder() -> SentenceTransformer:
+def get_encoder() -> _Embedder:
     global _encoder
     if _encoder is None:
         settings = get_settings()
-        _encoder = SentenceTransformer(settings.embedding_model)
+        if settings.embedding_provider == "openrouter":
+            _encoder = _OpenRouterEmbedder(
+                model=settings.embedding_model,
+                dimension=settings.embedding_dimension,
+                api_key=settings.openrouter_api_key,
+                base_url=settings.openrouter_base_url,
+            )
+        else:
+            _encoder = _LocalEmbedder(settings.embedding_model)
+        logger.info(
+            "Embeddings: provider=%s model=%s dim=%d",
+            settings.embedding_provider, settings.embedding_model, _encoder.dimension,
+        )
     return _encoder
 
 
 def get_qdrant_client() -> QdrantClient:
-    """Process-wide singleton — one HTTP connection pool, same pattern as get_encoder()."""
+    """Process-wide singleton."""
     global _client
     if _client is None:
         settings = get_settings()
@@ -49,13 +110,7 @@ def get_qdrant_client() -> QdrantClient:
 
 
 def ensure_collection(client: QdrantClient, collection_name: str, vector_size: int = 768) -> None:
-    """
-    Create the collection and its payload indexes.
-
-    Idempotent but not free — 4 round-trips. `_collection_ready` makes repeat calls
-    a no-op so per-document ingestion doesn't pay for it; `init_collection()` runs it
-    once at startup.
-    """
+    """Create the collection + payload indexes once per process."""
     global _collection_ready
     if _collection_ready == collection_name:
         return
@@ -66,9 +121,34 @@ def ensure_collection(client: QdrantClient, collection_name: str, vector_size: i
             collection_name=collection_name,
             vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
         )
-        logger.info("Created Qdrant collection: %s", collection_name)
-    # Qdrant Cloud requires payload indexes for filtered search.
-    # Safe to call repeatedly; if index exists, Qdrant treats it as update/no-op.
+        logger.info("Created Qdrant collection: %s (dim=%d)", collection_name, vector_size)
+    else:
+        # Vector size mismatch (model changed): recreate if empty, else fail loudly.
+        try:
+            info = client.get_collection(collection_name)
+            current = info.config.params.vectors.size  # type: ignore[union-attr]
+            if current != vector_size:
+                if (info.points_count or 0) == 0:
+                    client.delete_collection(collection_name)
+                    client.create_collection(
+                        collection_name=collection_name,
+                        vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+                    )
+                    logger.warning(
+                        "Recreated empty Qdrant collection %s: dim %d -> %d",
+                        collection_name, current, vector_size,
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Qdrant collection {collection_name!r} has vector size {current} but the "
+                        f"configured embedding model produces {vector_size}. Set QDRANT_COLLECTION "
+                        f"to a new name (or delete the old collection) and re-upload documents."
+                    )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            logger.debug("Could not verify collection vector size: %s", exc)
+    # Payload indexes are required for filtered search; idempotent.
     client.create_payload_index(
         collection_name=collection_name,
         field_name="doc_id",
@@ -79,8 +159,7 @@ def ensure_collection(client: QdrantClient, collection_name: str, vector_size: i
         field_name="language",
         field_schema=PayloadSchemaType.KEYWORD,
     )
-    # Full-text index on chunk text — enables keyword_search() for exact-token
-    # lookup of contract / invoice IDs that dense embeddings tend to miss.
+    # Full-text index for exact-token keyword_search().
     try:
         client.create_payload_index(
             collection_name=collection_name,
@@ -94,7 +173,7 @@ def ensure_collection(client: QdrantClient, collection_name: str, vector_size: i
             ),
         )
     except Exception as exc:
-        # Older Qdrant versions or unsupported tokenizer settings — non-fatal.
+        # Unsupported on older Qdrant — non-fatal.
         logger.debug("Text payload index create skipped: %s", exc)
 
     _collection_ready = collection_name
@@ -106,7 +185,7 @@ def init_collection() -> None:
     ensure_collection(
         get_qdrant_client(),
         settings.qdrant_collection,
-        get_encoder().get_sentence_embedding_dimension(),
+        get_encoder().dimension,
     )
 
 
@@ -119,21 +198,19 @@ def store_chunks(chunks: list[DocumentChunk]) -> int:
     client = get_qdrant_client()
     encoder = get_encoder()
 
-    vector_size = encoder.get_sentence_embedding_dimension()
-    ensure_collection(client, settings.qdrant_collection, vector_size)
+    ensure_collection(client, settings.qdrant_collection, encoder.dimension)
 
     texts = [c.normalized_text for c in chunks]
-    embeddings = encoder.encode(texts, batch_size=32, show_progress_bar=False)
+    embeddings = encoder.encode(texts)
 
     points = []
     for chunk, embedding in zip(chunks, embeddings):
-        # Deterministic point ID — re-uploading the same doc upserts in place
-        # instead of creating duplicate vector points.
+        # Deterministic id → re-uploads upsert in place.
         point_id = canonical_chunk_point_id(chunk.doc_id, chunk.chunk_index)
         points.append(
             PointStruct(
                 id=point_id,
-                vector=embedding.tolist(),
+                vector=embedding,
                 payload={
                     "chunk_id": chunk.chunk_id,
                     "doc_id": chunk.doc_id,
@@ -168,7 +245,7 @@ def semantic_search(
     client = get_qdrant_client()
     encoder = get_encoder()
 
-    query_vector = encoder.encode(query).tolist()
+    query_vector = encoder.encode_one(query)
 
     must_conditions = []
     if doc_ids:
@@ -188,9 +265,7 @@ def semantic_search(
 
     search_filter = Filter(must=must_conditions) if must_conditions else None
 
-    # Qdrant client API differs by version:
-    # - older: client.search(...)
-    # - newer (1.17+): client.query_points(...)
+    # search() on older clients, query_points() on 1.17+.
     if hasattr(client, "search"):
         results = client.search(
             collection_name=settings.qdrant_collection,
@@ -220,6 +295,26 @@ def semantic_search(
         }
         for hit in results
     ]
+
+
+def count_chunks_for_docs(doc_ids: list[str]) -> dict[str, int]:
+    """Exact stored-chunk count per doc_id — the ingestion half of the coverage report."""
+    if not doc_ids:
+        return {}
+    settings = get_settings()
+    client = get_qdrant_client()
+    counts: dict[str, int] = {}
+    for did in doc_ids:
+        try:
+            counts[did] = client.count(
+                collection_name=settings.qdrant_collection,
+                count_filter=Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=did))]),
+                exact=True,
+            ).count
+        except Exception as exc:
+            logger.warning("Chunk count failed for %s: %s", did, exc)
+            counts[did] = -1
+    return counts
 
 
 def get_all_chunks_for_docs(doc_ids: list[str], batch_size: int = 100) -> list[dict]:
@@ -266,13 +361,7 @@ def keyword_search(
     doc_ids: Optional[list[str]] = None,
     top_k: int = 10,
 ) -> list[dict]:
-    """Full-text keyword search over chunk `text` payload.
-
-    Complements :func:`semantic_search` for exact-token lookup of identifiers
-    (e.g. ``"INV-2024-0837"``, ``"C-MOH-2023-041"``) where dense embeddings
-    are unreliable. Requires the TEXT payload index created by
-    :func:`ensure_collection`.
-    """
+    """Exact-token search over chunk text (identifiers dense embeddings miss)."""
     kw = (keyword or "").strip()
     if not kw:
         return []
@@ -314,18 +403,6 @@ def keyword_search(
         }
         for rec in records
     ]
-
-
-def delete_doc_chunks(doc_id: str) -> None:
-    """Remove all chunks belonging to a document."""
-    settings = get_settings()
-    client = get_qdrant_client()
-    client.delete(
-        collection_name=settings.qdrant_collection,
-        points_selector=Filter(
-            must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
-        ),
-    )
 
 
 def delete_docs_chunks(doc_ids: list[str]) -> None:

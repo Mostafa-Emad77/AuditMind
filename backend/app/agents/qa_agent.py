@@ -1,12 +1,5 @@
-"""
-Conversational Q&A over an audited document set.
-
-A single-shot, retrieval-grounded answerer (not a ReAct loop): it always runs the
-hybrid retriever for the question, grounds the model on the retrieved snippets plus
-the audit report (findings + reconciliation), and streams the answer token-by-token.
-This is more robust than a tool-calling agent for the "why did you flag X / what's
-the total paid to Y" questions this UI is for.
-"""
+"""Single-shot, retrieval-grounded Q&A over an audited document set (snippets +
+report as context; streamed answer). No tool-calling loop."""
 import asyncio
 import json
 import logging

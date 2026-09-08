@@ -1,21 +1,11 @@
-"""
-Stable, document-independent signature for a Finding.
-
-Used by the false-positive feedback loop: when a reviewer dismisses a finding as a
-false positive, we store its signature in a global set; the cross-checker consults
-that set on later runs and suppresses matching candidates. The signature must be
-stable across audits (different doc_ids, slightly different wording) so it is built
-from the finding's *topic* plus its *canonical headline amounts* — never from
-doc_ids, pages, or evidence text.
-"""
+"""Stable, document-independent Finding signature for the false-positive feedback
+loop: topic + canonical headline amounts, never doc_ids/pages/evidence."""
 from typing import Any
 
 from app.utils.arabic_normalizer import extract_amounts
 from app.utils.money_parse import parse_monetary_amount
 
-# Coarse topic buckets keyed off keywords in the title/description. Mirrors the
-# spirit of the cross-checker's dedup buckets but is intentionally self-contained
-# (no imports from the heavy cross_checker module).
+# Coarse topic buckets (self-contained; no cross_checker import).
 _TOPIC_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
     ("overpayment", ("overpay", "exceeds", "overrun", "above contract", "beyond the contract", "variance")),
     ("bank_recon", ("bank", "paid", "payment", "transfer", "disburse", "remittance", "debit", "credit")),
@@ -64,14 +54,7 @@ def _headline_amounts(text: str) -> list[int]:
 
 
 def finding_signature(finding: Any) -> str:
-    """
-    Build a stable signature string for a finding.
-
-    Shape: ``"<topic>|<amount1,amount2,...>"`` when the finding carries headline
-    amounts; otherwise ``"<topic>|t:<title-prefix>"`` so text-only findings can
-    still be suppressed. ``finding`` may be a Pydantic ``Finding`` or any object
-    exposing ``title`` / ``description``.
-    """
+    """"<topic>|<amounts>" when headline amounts exist, else "<topic>|t:<title-prefix>"."""
     title = str(getattr(finding, "title", "") or "")
     description = str(getattr(finding, "description", "") or "")
     text = f"{title}\n{description}".lower()

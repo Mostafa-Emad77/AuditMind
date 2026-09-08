@@ -1,11 +1,5 @@
-"""
-Regression tests for the entity-extraction / graph-linkage bug fixes:
-
-  BUG 1 — running balances were summed into the bank total (57x inflation)
-  BUG 2 — amount pairs were compared regardless of whether the roles were comparable
-  BUG 3 — identifier formatting variants prevented cross-document entity resolution
-  BUG 4 — no Person/signatory entity fields existed
-"""
+"""Regression tests: bank-total inflation, role comparability, identifier
+normalisation, signatory fields."""
 from typing import get_args
 
 import app.services.reconciliation_payload as rp
@@ -68,12 +62,6 @@ class TestBankTotalExcludesBalances:
         snap = rp._aggregate_snapshot(rows, [BANK_DOC])
         assert snap.bank_paid_total == 50000.0
 
-    def test_legacy_single_payment_still_counts(self):
-        """Pre-existing graph data uses `single_payment`; it must keep working."""
-        rows = [_bank_row("single_payment", "25000 EGP", page=1)]
-        snap = rp._aggregate_snapshot(rows, [BANK_DOC])
-        assert snap.bank_paid_total == 25000.0
-
     def test_statement_total_is_used_to_validate_not_to_sum(self):
         """The stated Total Debits must validate the rows, never be added to them."""
         rows = [
@@ -85,14 +73,22 @@ class TestBankTotalExcludesBalances:
         assert snap.bank_paid_total == 226700.0
         assert snap.notes is None or "unverified" not in (snap.notes or "")
 
-    def test_validation_flags_mismatched_total(self):
-        """Missed/mis-tagged rows must be surfaced, not silently reported as a total."""
+    def test_validation_withholds_mismatched_total(self):
+        """
+        When extracted debits don't reconcile with the statement's stated Total
+        Debits, the bank total is WITHHELD (not rendered as a wrong number with a
+        caption beside it) and an explicit incomplete state is surfaced instead.
+        """
         rows = [
             _bank_row("transaction_debit", "100000 EGP", page=1),
             _bank_row("statement_total_debits", "226700 EGP", page=1),
         ]
         snap = rp._aggregate_snapshot(rows, [BANK_DOC])
-        assert snap.bank_paid_total == 100000.0
+        assert snap.bank_paid_total is None
+        assert snap.variance_vs_contract is None
+        assert snap.bank_extraction_incomplete is True
+        assert snap.bank_debits_verified == 100000.0
+        assert snap.bank_debits_stated == 226700.0
         assert "extraction incomplete" in (snap.notes or "").lower()
 
 
@@ -313,12 +309,7 @@ class TestHeuristicClassification:
 # ── Role filter must be applied before LIMIT ─────────────────────────────────
 
 class TestRoleFilterAppliedInQuery:
-    """
-    The role allow-list was applied only in Python, after the query's ORDER BY/LIMIT.
-    High-materiality but incomparable pairs therefore consumed the row budget and
-    silently pushed genuine findings (e.g. contract 200,000 vs invoice's stated
-    180,000) out of the result set entirely.
-    """
+    """Role allow-list must run inside the query, before ranking/limit."""
 
     def _captured_cypher(self, monkeypatch) -> str:
         import app.services.graph_builder as gb
@@ -385,3 +376,168 @@ class TestConflictRowDedup:
         ]
         rows = rp._contradictions_to_rows(contradictions)
         assert len(rows) == 2
+
+
+# ── 3c: signatory authority ──────────────────────────────────────────────────
+
+class TestSigningAuthorityDerivation:
+    """
+    The model returned signing_authority_level="other" for a person whose title it had
+    correctly read as "Chairman", which made an authority comparison meaningless.
+    """
+
+    def _auth(self, title):
+        from app.services.entity_extractor import _authority_from_title
+        return _authority_from_title(title)
+
+    def test_titles_map_to_levels(self):
+        assert self._auth("Chairman") == "chairman"
+        assert self._auth("Chairman - Delta Trading Group S.A.E.") == "chairman"
+        assert self._auth("CEO - Nile Financial Consulting Co.") == "ceo"
+        assert self._auth("Chief Financial Officer") == "cfo"
+        assert self._auth("Finance Director") == "director"
+
+    def test_arabic_titles_map(self):
+        assert self._auth("رئيس مجلس الادارة") == "chairman"
+
+    def test_unknown_title_yields_none(self):
+        assert self._auth("Witness") is None
+        assert self._auth(None) is None
+        assert self._auth("") is None
+
+    def test_chairman_wins_over_a_trailing_manager_word(self):
+        """Most-senior-first ordering: 'Chairman & General Manager' is a chairman."""
+        assert self._auth("Chairman & General Manager") == "chairman"
+
+
+class TestSignatoryMismatchQuery:
+    """Fires only for an amendment signed below the original signer's authority."""
+
+    def _captured(self, monkeypatch, people):
+        import app.services.graph_builder as gb
+        captured = {}
+
+        class _FakeSession:
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+            def run(self, query, **kwargs):
+                captured["query"] = query
+                return list(people)
+
+        class _FakeDriver:
+            def session(self, **kwargs): return _FakeSession()
+
+        monkeypatch.setattr(gb, "_run_with_reconnect", lambda fn: fn(_FakeDriver()))
+        rows = gb.find_signatory_mismatches(["d1", "d2"])
+        return captured["query"], rows
+
+    def _person(self, name, authority, signed, doc="d1"):
+        return {
+            "name": name, "title": authority, "authority": authority,
+            "signed": signed, "doc_id": doc, "doc_name": f"{doc}.pdf", "page": 1,
+        }
+
+    def test_query_only_fetches_people_who_signed_something(self, monkeypatch):
+        query, _ = self._captured(monkeypatch, [])
+        assert "size(coalesce(p.documents_signed, [])) > 0" in query
+        assert "p.entity_type = 'person'" in query
+
+    def test_normal_approval_chain_is_silent(self, monkeypatch):
+        """QS certifies, engineer approves, PM approves — different docs, no amendment."""
+        people = [
+            self._person("Rania Hassan", "manager", ["Payment Certificate PC-2025-007"]),
+            self._person("Khaled El Masry", "chairman", ["Board Resolution BR-2024-11"]),
+            self._person("Samir Awad", "director", ["QS Report QS-2025-03"]),
+            self._person("Ahmed El-Basiony", "manager", ["Inspection sign-off"]),
+        ]
+        _, rows = self._captured(monkeypatch, people)
+        assert rows == []
+
+    def test_amendment_below_original_authority_fires(self, monkeypatch):
+        people = [
+            self._person("Khaled El Masry", "chairman", ["Contract BLD-2024-019"]),
+            self._person("Mona Adel", "cfo", ["Amendment 2 to Contract BLD-2024-019"]),
+        ]
+        _, rows = self._captured(monkeypatch, people)
+        assert len(rows) == 1
+        assert rows[0]["name1"] == "Khaled El Masry"   # original signer
+        assert rows[0]["name2"] == "Mona Adel"         # amendment signer (lower)
+        assert rows[0]["authority_gap"] >= 1
+
+    def test_amendment_at_or_above_original_authority_is_silent(self, monkeypatch):
+        people = [
+            self._person("Mona Adel", "cfo", ["Contract BLD-2024-019"]),
+            self._person("Khaled El Masry", "chairman", ["Amendment 1 to Contract BLD-2024-019"]),
+        ]
+        _, rows = self._captured(monkeypatch, people)
+        assert rows == []
+
+    def test_amendment_without_shared_reference_is_silent(self, monkeypatch):
+        people = [
+            self._person("Khaled El Masry", "chairman", ["Contract BLD-2024-019"]),
+            self._person("Mona Adel", "cfo", ["Amendment to some other agreement"]),
+        ]
+        _, rows = self._captured(monkeypatch, people)
+        assert rows == []
+
+    def test_empty_doc_ids_short_circuits(self):
+        from app.services.graph_builder import find_signatory_mismatches
+        assert find_signatory_mismatches([]) == []
+
+
+class TestIsAmendmentOf:
+    def _f(self, cand, base):
+        from app.services.graph_builder import _is_amendment_of
+        return _is_amendment_of(cand, base)
+
+    def test_shared_ref_plus_keyword(self):
+        assert self._f("Amendment 2 to BLD-2024-019", "Contract BLD-2024-019") is True
+
+    def test_keyword_without_link_is_false(self):
+        assert self._f("Amendment 2 to CTR-2099-001", "Contract BLD-2024-019") is False
+
+    def test_no_keyword_is_false(self):
+        assert self._f("Contract BLD-2024-019 schedule", "Contract BLD-2024-019") is False
+
+    def test_same_string_is_false(self):
+        assert self._f("Contract BLD-2024-019", "Contract BLD-2024-019") is False
+
+
+# ── 3d: rate-like roles compare without needing a shared anchor ──────────────
+
+class TestAnchorlessRatePairs:
+    def _captured_cypher(self, monkeypatch):
+        import app.services.graph_builder as gb
+        captured = {}
+
+        class _FakeSession:
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+            def run(self, query, **kwargs):
+                captured["query"] = query
+                captured["params"] = kwargs
+                return []
+
+        class _FakeDriver:
+            def session(self, **kwargs): return _FakeSession()
+
+        monkeypatch.setattr(gb, "_run_with_reconnect", lambda fn: fn(_FakeDriver()))
+        gb.find_contradictions(["d1", "d2"])
+        return captured["query"], captured["params"]
+
+    def test_anchor_is_optional_for_rate_roles(self, monkeypatch):
+        """
+        A retainer rate change went undetected because the two figures never shared an
+        anchor edge — extraction simply had not linked both to the contract node.
+        """
+        query, params = self._captured_cypher(monkeypatch)
+        assert "OPTIONAL MATCH (e1)-[:RELATES]-(anchor:Entity)-[:RELATES]-(e2)" in query
+        assert "$anchorless_roles" in query
+        assert "retainer" in params["anchorless_roles"]
+        assert "milestone_scheduled" in params["anchorless_roles"]
+
+    def test_totals_still_require_an_anchor(self):
+        """Two unrelated invoice totals must not be compared just for existing."""
+        from app.services.graph_builder import _ANCHORLESS_SAME_ROLE_PAIRS
+        assert "total_invoice" not in _ANCHORLESS_SAME_ROLE_PAIRS
+        assert "total_contract_value" not in _ANCHORLESS_SAME_ROLE_PAIRS

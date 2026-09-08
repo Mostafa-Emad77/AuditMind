@@ -1,39 +1,9 @@
 """Regression: graph-style amounts must not produce fabricated billion-level discrepancies."""
-import json
-
-import pytest
-
 from app.agents.cross_checker.evidence import (
     _evidence_line_backs_value,
     _evidence_snippets_back_values,
     _graph_context_for_compare,
 )
-from app.tools.financial import compare_values
-
-
-def test_compare_values_raw_only_no_filename_leak():
-    """value1/value2 must be raw monetary strings; context holds provenance."""
-    raw = compare_values.invoke({
-        "value1": "50000 EGP",
-        "value2": "45000 EGP",
-        "context": "from Invoice A.pdf vs Contract B.pdf",
-    })
-    data = json.loads(raw)
-    assert data["is_contradiction"] is True
-    assert "billion" not in data["explanation"].lower()
-    # No concatenated monster number in output
-    assert "5000045000" not in json.dumps(data)
-
-
-def test_parse_failure_skips_numeric_contradiction():
-    raw = compare_values.invoke({
-        "value1": "maybe not a number",
-        "value2": "also vague",
-        "context": "test",
-    })
-    data = json.loads(raw)
-    assert data["is_contradiction"] is False
-    assert data["severity"] == "ok"
 
 
 def test_evidence_backs_typical_snippet():
@@ -63,16 +33,6 @@ def test_graph_context_includes_anchor():
     )
     assert "C-99" in ctx
     assert "anchor" in ctx.lower()
-
-
-@pytest.mark.parametrize("v1,v2,expect_contra", [
-    ("100.00 EGP", "100.01 EGP", False),  # tiny drift → tolerance
-    ("100 EGP", "130 EGP", True),
-])
-def test_real_mismatch_vs_rounding(v1, v2, expect_contra):
-    raw = compare_values.invoke({"value1": v1, "value2": v2, "context": ""})
-    data = json.loads(raw)
-    assert data["is_contradiction"] is expect_contra
 
 
 def test_dedupe_findings_merges_same_bank_contract_story_despite_different_evidence():

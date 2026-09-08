@@ -69,7 +69,7 @@ flowchart TD
 |-------|------------|
 | Agents | LangGraph 0.2 (`StateGraph`) |
 | LLM | [OpenRouter](https://openrouter.ai/) (default) or [Google AI Studio](https://aistudio.google.com/) (Gemini) — set `LLM_PROVIDER` |
-| Embeddings | `sentence-transformers/paraphrase-multilingual-mpnet-base-v2` (768-dim, multilingual) |
+| Embeddings | `openai/text-embedding-3-small` via OpenRouter (1536-dim) — or a local SentenceTransformer with `EMBEDDING_PROVIDER=local` |
 | OCR | EasyOCR (multilingual), ArabicOCR fallback (Python <3.12), PyMuPDF for digital PDFs |
 | Vector DB | Qdrant |
 | Graph DB | Neo4j (Aura or self-hosted) |
@@ -152,7 +152,6 @@ npm run dev
 | `/api/audit/{id}/start` | POST | Start (or resume) background audit pipeline |
 | `/api/audit/{id}/stream` | GET | SSE stream of agent events |
 | `/api/audit/{id}/report` | GET | Completed audit report (JSON) |
-| `/api/audit/{id}/graph` | GET | Knowledge graph (query params: `center_node`, `depth`, `view`) |
 | `/api/audit/{id}/status` | GET | Session status and document list |
 | `/api/audit/{id}/chat` | GET | Chat history for an audit |
 | `/api/audit/{id}/chat` | POST | Ask a question (SSE-streamed retrieval-grounded answer) |
@@ -205,7 +204,9 @@ Settings are loaded from `backend/.env` and validated by `app/config.py` (Pydant
 | `QDRANT_API_KEY` | — | Required for Qdrant Cloud |
 | `QDRANT_COLLECTION` | `auditmind_docs` | Qdrant collection name |
 | `REDIS_URL` | `redis://localhost:6379` | Session, report, chat, and triage storage (7-day TTL) |
-| `EMBEDDING_MODEL` | `sentence-transformers/paraphrase-multilingual-mpnet-base-v2` | Multilingual sentence embedding model |
+| `EMBEDDING_PROVIDER` | `openrouter` | `openrouter` (OpenAI-compatible `/embeddings`, uses `OPENROUTER_API_KEY`) or `local` (SentenceTransformer) |
+| `EMBEDDING_MODEL` | `openai/text-embedding-3-small` | OpenRouter slug, or a SentenceTransformer name when `EMBEDDING_PROVIDER=local` |
+| `EMBEDDING_DIMENSION` | `1536` | Vector size for the `openrouter` provider (local models report their own). Changing models requires a new `QDRANT_COLLECTION` |
 | `EXTRACTION_CONCURRENCY` | `3` | Parallel LLM calls inside the entity extractor; reduce to `1` on free-tier rate limits |
 | `EXTRACTION_CHUNK_SLEEP` | `0.0` | Seconds to sleep between extraction batches (e.g. `4.0` for free-tier rate limits) |
 | `EXTRACTION_TOP_K_BASE` | `50` | Base `top_k` for extraction queries on small docs (≤5 pages) |

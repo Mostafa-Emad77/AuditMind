@@ -1,6 +1,5 @@
 """AuditMind FastAPI application — main entry point."""
 import asyncio
-import functools
 import json
 import logging
 import os
@@ -23,19 +22,17 @@ from app.models.schemas import (
     AuditSession,
     AuditSummary,
     ChatRequest,
-    GraphData,
     TriageRecord,
     TriageRequest,
     UploadFileError,
     UploadResponse,
 )
 from app.services.document_processor import ingest_document
-from app.services.graph_builder import close_driver, delete_audit_documents, get_entity_graph, init_graph_schema
+from app.services.graph_builder import close_driver, delete_audit_documents, init_graph_schema
 from app.services.vector_store import delete_docs_chunks, init_collection
 from app.services.redis_store import (
     add_suppressed_signature,
     append_audit_event,
-    append_chat_messages,
     clear_audit_events,
     close_redis,
     find_document,
@@ -59,16 +56,11 @@ from app.utils.finding_signature import finding_signature
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
 
-# Thread pool for CPU-bound work (OCR, embedding) so it doesn't block the event loop.
-# OCR is the bottleneck on multi-doc uploads; size to the core count so concurrent
-# ingestion (asyncio.gather below) actually utilizes the machine.
+# CPU-bound work (OCR, embedding) off the event loop; sized to cores.
 _executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
 
-# In-process registry of running audit pipeline tasks, keyed by audit_id.
-# The pipeline itself runs as a free-standing asyncio.Task (not tied to any SSE
-# connection), so a client disconnecting from /stream no longer cancels the audit.
-# This dict only prevents duplicate task creation within a single process/worker;
-# cross-process/restart staleness is handled by the heartbeat TTL (see below).
+# Running pipeline tasks by audit_id (free-standing, not tied to an SSE client).
+# Prevents duplicates in-process; cross-process staleness uses the heartbeat TTL.
 _running_audits: dict[str, asyncio.Task] = {}
 
 
@@ -279,7 +271,6 @@ async def _run_audit_pipeline(audit_id: str) -> None:
         "report": None,
         "reasoning_trace": [],
         "report_language": current_session.report_language,
-        "extraction_complete": False,
         "error": None,
         "api_key": current_session.api_key,
     }
@@ -362,18 +353,8 @@ async def start_audit(audit_id: str):
 
 @api_router.get("/audit/{audit_id}/stream")
 async def stream_audit(audit_id: str):
-    """
-    Subscribe to an audit's Server-Sent Events. Starts the pipeline if it hasn't
-    been started yet; otherwise replays every event persisted so far and then tails
-    new ones as they're produced by the (independently running) background task.
-
-    Event types:
-    - connected       — session acknowledged
-    - reasoning_step  — agent thought / tool call / tool result / finding
-    - report_ready    — report has been generated and saved
-    - complete        — audit pipeline finished
-    - error           — an error occurred
-    """
+    """SSE subscription: starts the pipeline if needed, replays persisted events, then tails.
+    Events: connected, reasoning_step, report_ready, complete, error."""
     session = await get_session(audit_id)
     if not session:
         raise HTTPException(status_code=404, detail=f"Audit session '{audit_id}' not found.")
@@ -420,13 +401,7 @@ async def stream_audit(audit_id: str):
 
 @api_router.get("/audit/{audit_id}/report")
 async def get_audit_report(audit_id: str):
-    """Retrieve the completed audit report.
-
-    Returns 200 with `{"status": "processing"|"pending"|"failed", ...}` while the
-    audit hasn't finished yet — the audit is still processing, not an error
-    condition, so this intentionally avoids the anti-pattern of raising an
-    HTTPException with a 2xx status code.
-    """
+    """Completed report, or 200 + {"status": ...} while the audit is still running."""
     report = await get_report(audit_id)
     if not report:
         session = await get_session(audit_id)
@@ -507,14 +482,8 @@ async def get_audit_triage(audit_id: str):
 
 @api_router.post("/audit/{audit_id}/findings/{finding_id}/triage")
 async def triage_finding(audit_id: str, finding_id: str, body: TriageRequest):
-    """
-    Record a reviewer's verdict on a finding (accepted / dismissed / false_positive).
-
-    Marking a finding as a false positive stores its signature in a set scoped to the
-    audit's API key so the cross-checker can suppress matching findings on future runs
-    by that same caller. Changing the verdict away from false_positive lifts that
-    suppression.
-    """
+    """Record a reviewer verdict. false_positive stores the finding's signature (per API
+    key) so future runs suppress it; any other verdict lifts that suppression."""
     session = await get_session(audit_id)
     if not session:
         raise HTTPException(status_code=404, detail="Audit session not found.")
@@ -541,35 +510,6 @@ async def triage_finding(audit_id: str, finding_id: str, body: TriageRequest):
 
 
 # ─── Knowledge Graph ──────────────────────────────────────────────────────────
-
-@api_router.get("/audit/{audit_id}/graph", response_model=GraphData)
-async def get_graph(
-    audit_id: str,
-    center_node: str | None = Query(default=None),
-    depth: int = Query(default=1, ge=1, le=3),
-    view: str = Query(default="canonical", pattern="^(canonical|raw)$"),
-):
-    """Retrieve the knowledge graph (nodes + edges) for visualization."""
-    session = await get_session(audit_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Audit session not found.")
-
-    doc_ids = [d.doc_id for d in session.documents]
-    try:
-        # get_entity_graph uses the sync Neo4j driver — offload so it doesn't block the event loop.
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,
-            functools.partial(
-                get_entity_graph, doc_ids, center_node=center_node, depth=depth, view=view
-            ),
-        )
-    except Exception as e:
-        logger.error("Failed to retrieve graph for audit %s: %s", audit_id, e)
-        raise HTTPException(status_code=500, detail=f"Graph retrieval failed: {str(e)}")
-
-
-# ─── Audit Deletion (data lifecycle) ──────────────────────────────────────────
 
 @api_router.delete("/audit/{audit_id}")
 async def delete_audit(audit_id: str):

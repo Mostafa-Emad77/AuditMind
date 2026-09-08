@@ -12,38 +12,34 @@ class TestRolesAreComparable:
     def test_opening_balance_vs_anything_is_incompatible(self):
         assert not _roles_are_comparable("opening_balance", "total_contract_value")
         assert not _roles_are_comparable("opening_balance", "total_invoice")
-        assert not _roles_are_comparable("opening_balance", "single_payment")
+        assert not _roles_are_comparable("opening_balance", "transaction_debit")
         assert not _roles_are_comparable("opening_balance", "unknown")
 
     def test_closing_balance_vs_anything_is_incompatible(self):
         assert not _roles_are_comparable("closing_balance", "total_contract_value")
-        assert not _roles_are_comparable("closing_balance", "single_payment")
+        assert not _roles_are_comparable("closing_balance", "transaction_debit")
 
     def test_total_contract_vs_total_invoice_is_compatible(self):
         assert _roles_are_comparable("total_contract_value", "total_invoice")
         assert _roles_are_comparable("total_invoice", "total_contract_value")
 
-    def test_single_payment_vs_total_contract_is_incompatible(self):
-        assert not _roles_are_comparable("single_payment", "total_contract_value")
-        assert not _roles_are_comparable("total_contract_value", "single_payment")
+    def test_transaction_debit_vs_total_contract_is_incompatible(self):
+        assert not _roles_are_comparable("transaction_debit", "total_contract_value")
+        assert not _roles_are_comparable("total_contract_value", "transaction_debit")
 
-    def test_single_payment_vs_total_invoice_is_incompatible(self):
-        assert not _roles_are_comparable("single_payment", "total_invoice")
+    def test_transaction_debit_vs_total_invoice_is_incompatible(self):
+        """Invoices settle in installments — reconcile against the SUM, never one debit."""
+        assert not _roles_are_comparable("transaction_debit", "total_invoice")
 
     def test_unknown_vs_anything_is_rejected(self):
-        """
-        `unknown` previously passed through as comparable-with-anything. Combined with
-        untagged running-balance figures, that is what produced conflicts like
-        "running balance 750,000 vs line item 25,000". An amount that could not be
-        classified is no longer grounds for comparison.
-        """
+        """An unclassified amount is never grounds for comparison."""
         assert not _roles_are_comparable("unknown", "total_contract_value")
-        assert not _roles_are_comparable("unknown", "single_payment")
+        assert not _roles_are_comparable("unknown", "transaction_debit")
         assert not _roles_are_comparable("unknown", "unknown")
 
-    def test_milestone_vs_single_payment_is_compatible(self):
-        assert _roles_are_comparable("milestone_scheduled", "single_payment")
-        assert _roles_are_comparable("single_payment", "milestone_scheduled")
+    def test_milestone_vs_transaction_debit_is_compatible(self):
+        assert _roles_are_comparable("milestone_scheduled", "transaction_debit")
+        assert _roles_are_comparable("transaction_debit", "milestone_scheduled")
 
     def test_none_treated_as_unknown_and_rejected(self):
         assert not _roles_are_comparable(None, "total_contract_value")
@@ -59,9 +55,9 @@ class TestFalsePositiveRegression:
         """320,000 opening balance must NOT be compared to 180,000 invoice claim."""
         assert not _roles_are_comparable("opening_balance", "total_invoice")
 
-    def test_single_payment_not_compared_to_contract_total(self):
+    def test_transaction_debit_not_compared_to_contract_total(self):
         """50,000 advance payment must NOT be compared to 200,000 contract total."""
-        assert not _roles_are_comparable("single_payment", "total_contract_value")
+        assert not _roles_are_comparable("transaction_debit", "total_contract_value")
 
 
 # ── Entity schema ────────────────────────────────────────────────────────────

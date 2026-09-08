@@ -8,14 +8,8 @@ async def require_api_key(
     x_api_key: str = Header(default=""),
     api_key: str = Query(default=""),
 ) -> str:
-    """
-    Validate the caller's API key against the configured allowlist.
-
-    If API_KEYS is unset, auth is disabled and every caller resolves to the
-    shared "default" scope (today's behavior, unchanged). ``api_key`` is
-    accepted as a query param too because ``EventSource`` (used for the SSE
-    stream) cannot set custom headers.
-    """
+    """Validate the API key (query param allowed: EventSource can't set headers).
+    With API_KEYS unset, auth is off and callers share the "default" scope."""
     settings = get_settings()
     keys = settings.api_keys_list
     if not keys:

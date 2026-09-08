@@ -43,11 +43,7 @@ class TestFindContradictionsRoleFilter:
         assert kept[0]["role2"] == "total_invoice"
 
     def test_unknown_roles_are_dropped(self, monkeypatch):
-        """
-        Unknown-role pairs used to be kept (treated as comparable-with-anything).
-        That permissiveness is what let untagged running balances be compared against
-        line items, so unclassified amounts are now excluded.
-        """
+        """Unknown-role pairs are excluded."""
         rows = [_pair("unknown", "total_invoice"), _pair("unknown", "unknown")]
         monkeypatch.setattr(gb, "_run_with_reconnect", lambda _fn: rows)
 

@@ -37,11 +37,28 @@ def _extract_id_like_tokens(query: str) -> list[str]:
     return tokens
 
 
+def _regex_query_entities(q: str) -> list[str]:
+    """Deterministic entity pull: amounts, capitalised terms, long numbers, Arabic words."""
+    entities = []
+    amount_matches = extract_amounts(q)
+    entities.extend(a["raw"] for a in amount_matches)
+    words = re.findall(r"\b[A-Z][a-zA-Z]+\b|\b\d{4,}\b", q)
+    entities.extend(words[:5])
+    arabic_words = re.findall(r"[؀-ۿ]{3,}", q)
+    entities.extend(arabic_words[:5])
+    return list(dict.fromkeys(entities))
+
+
 def _extract_query_entities(query: str) -> list[str]:
-    """Extract graph-traversal entities using LLM, with safe regex fallback."""
+    """Graph-traversal entities for a query. Regex by default; LLM path is opt-in
+    (it cost one slow call per checklist item for no extra recall)."""
+    from app.config import get_settings
+
     q = (query or "").strip()
     if not q:
         return []
+    if not get_settings().retriever_llm_query_entities:
+        return _regex_query_entities(q)
 
     prompt = (
         "Extract traversal entities from this audit query.\n"
@@ -78,19 +95,10 @@ def _extract_query_entities(query: str) -> list[str]:
         pass
 
     # Fallback: minimal regex extraction to avoid empty graph route.
-    entities = []
-    amount_matches = extract_amounts(q)
-    entities.extend(a["raw"] for a in amount_matches)
-    words = re.findall(r"\b[A-Z][a-zA-Z]+\b|\b\d{4,}\b", q)
-    entities.extend(words[:5])
-    arabic_words = re.findall(r"[\u0600-\u06FF]{3,}", q)
-    entities.extend(arabic_words[:5])
-    return list(dict.fromkeys(entities))
+    return _regex_query_entities(q)
 
 
-# Relational signals that make graph traversal the better backend (rule-based, no LLM).
-# Kept deliberately narrow so the common factual check stays on the cheaper vector path
-# (and avoids triggering the entity-extraction LLM call inside the graph branch).
+# Relational signals that add graph traversal (rule-based, no LLM).
 _GRAPH_ROUTE_KEYWORDS = (
     "reconcil", "contradict", "cross-document", "cross document",
     "across documents", "between documents", "versus", " vs ",
@@ -99,12 +107,7 @@ _GRAPH_ROUTE_KEYWORDS = (
 
 
 def _route_query(query: str) -> tuple[str, str, str]:
-    """
-    Decide retrieval path with deterministic rules (no LLM call):
-      - graph: relational / cross-document checks (entity links, contradictions, reconciliation)
-      - vector: factual / semantic lookup
-    Returns: (route, reason, router_source)
-    """
+    """Rule-based route: graph for relational/cross-doc checks, else vector."""
     q = (query or "").strip()
     if not q:
         return "vector", "Empty query defaults to semantic search.", "fallback"
@@ -119,19 +122,10 @@ def _route_query(query: str) -> tuple[str, str, str]:
 
 @tool
 def search_hybrid_rag(query: str, doc_ids: str, top_k: int = 10) -> str:
-    """
-    Hybrid retrieval combining Qdrant semantic search AND Neo4j graph traversal.
-    This is the primary tool for finding relevant information across all documents.
+    """Hybrid retrieval: Qdrant semantic search plus additive Neo4j graph hits.
 
-    Use this when checking consistency, finding specific clauses, or looking up values.
-
-    Args:
-        query: Natural language query describing what information you need
-        doc_ids: Comma-separated document IDs to search across
-        top_k: Number of semantic results to return (graph results are additional)
-
-    Returns:
-        JSON string with merged results from both vector and graph search
+    query: natural-language need; doc_ids: comma-separated; top_k: semantic results.
+    Returns JSON with merged results.
     """
     ids = [d.strip() for d in doc_ids.split(",") if d.strip()]
 
@@ -144,37 +138,32 @@ def search_hybrid_rag(query: str, doc_ids: str, top_k: int = 10) -> str:
     keyword_results: list[dict] = []
     effective_route = route
 
-    # Sparse channel — always run for ID-like tokens; cheap and high-precision
-    # for invoice/contract numbers that dense embeddings often miss.
+    # Sparse channel for ID-like tokens dense embeddings miss.
     id_tokens = _extract_id_like_tokens(query)
     for tok in id_tokens:
         keyword_results.extend(
             keyword_search(keyword=tok, doc_ids=ids if ids else None, top_k=max(3, top_k // 2))
         )
 
-    if route == "vector":
-        vector_results = semantic_search(query=query, doc_ids=ids if ids else None, top_k=top_k)
-    else:
+    # Semantic search always runs; graph hits are additive, never a replacement.
+    vector_results = semantic_search(query=query, doc_ids=ids if ids else None, top_k=top_k)
+    if route == "graph":
         if ids:
             query_entities = _extract_query_entities(query)
             if query_entities:
                 graph_results = query_graph_for_entities(query_entities, ids, depth=2)
-            else:
-                # Graph route with no entities to traverse → safe fallback.
-                vector_results = semantic_search(query=query, doc_ids=ids if ids else None, top_k=top_k)
+            if not graph_results:
                 effective_route = "vector"
-                route_reason = "Graph route had no extractable entities; used semantic fallback."
+                route_reason = "Graph traversal found no linked entities; semantic results only."
         else:
-            vector_results = semantic_search(query=query, doc_ids=None, top_k=top_k)
             effective_route = "vector"
-            route_reason = "Graph traversal requires doc_ids; used semantic fallback."
+            route_reason = "Graph traversal requires doc_ids; semantic results only."
 
     # 3) Merge and deduplicate
     seen_texts = set()
     merged = []
 
-    # Keyword (sparse) hits go first — exact identifier matches are highest
-    # precision and we want them at the top of the merged list.
+    # Exact identifier hits first.
     for r in keyword_results:
         key = (r.get("text") or "")[:100]
         if key and key not in seen_texts:

@@ -38,9 +38,6 @@ class AuditState(TypedDict):
     # Report language preference
     report_language: str  # "arabic" | "english"
 
-    # Whether graph and vector stores are populated
-    extraction_complete: bool
-
     # Error tracking
     error: Optional[str]
 

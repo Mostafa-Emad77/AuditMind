@@ -89,9 +89,10 @@ export default function AuditPage({ params }: { params: Promise<{ id: string }> 
   })();
 
   return (
-    <div className="min-h-screen bg-background flex flex-col">
+    // Pinned to the viewport so only the two inner panes scroll, not the window.
+    <div className="h-screen overflow-hidden bg-background flex flex-col">
       {/* Top navigation */}
-      <header className="bg-white border-b border-outline-variant flex justify-between items-center px-6 py-3 w-full z-50">
+      <header className="bg-white border-b border-outline-variant flex justify-between items-center px-6 py-3 w-full z-50 shrink-0">
         <div className="flex items-center gap-6">
           <button
             onClick={() => router.push("/")}
@@ -135,10 +136,10 @@ export default function AuditPage({ params }: { params: Promise<{ id: string }> 
         </div>
       </header>
 
-      {/* Body: sidebar + content */}
-      <div className="flex flex-1 overflow-hidden" style={{ height: "calc(100vh - 57px)" }}>
+      {/* min-h-0: lets each pane scroll independently. */}
+      <div className="flex flex-1 min-h-0 overflow-hidden">
         {/* Left sidebar — Reasoning Trace */}
-        <aside className="bg-[#f8fafc] border-r border-outline-variant w-60 shrink-0 flex flex-col z-40 h-full">
+        <aside className="bg-[#f8fafc] border-r border-outline-variant w-60 shrink-0 flex flex-col z-40 min-h-0">
           <ReasoningPanel
             steps={steps}
             agentStatuses={agentStatuses}
@@ -148,7 +149,7 @@ export default function AuditPage({ params }: { params: Promise<{ id: string }> 
         </aside>
 
         {/* Main canvas */}
-        <main className="flex-1 flex flex-col bg-background overflow-hidden">
+        <main className="flex-1 min-w-0 min-h-0 flex flex-col bg-background overflow-hidden">
           {/* Status header */}
           <div className="px-8 py-5 border-b border-outline-variant bg-white shrink-0">
             {/* Banners */}

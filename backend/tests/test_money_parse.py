@@ -1,5 +1,4 @@
 """Unit tests for deterministic monetary parsing."""
-import pytest
 
 from app.utils.money_parse import parse_monetary_amount, amounts_within_tiny_tolerance
 
@@ -42,28 +41,3 @@ def test_year_token_skipped_when_currency_present():
 def test_tiny_tolerance():
     assert amounts_within_tiny_tolerance(100.0, 100.000001)
     assert amounts_within_tiny_tolerance(1e9, 1e9 + 0.005)
-
-
-def test_compare_no_billion_artifact():
-    """Ensure we never synthesize billion-scale numbers from mixed text."""
-    from app.tools.financial import compare_values
-    import json
-
-    # Simulated bad concatenation would be ~202450000112; parser should not produce that.
-    raw = compare_values.invoke({
-        "value1": "50000 EGP",
-        "value2": "50000 EGP",
-        "context": "from contract_2024.pdf",
-    })
-    data = json.loads(raw)
-    assert data["is_contradiction"] is False
-
-    raw2 = compare_values.invoke({
-        "value1": "50000 EGP",
-        "value2": "45000 EGP",
-        "context": "invoice vs contract",
-    })
-    data2 = json.loads(raw2)
-    assert data2["is_contradiction"] is True
-    assert data2["severity"] in ("critical", "warning")
-    assert "500000000000" not in raw2

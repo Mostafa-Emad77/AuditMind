@@ -15,7 +15,7 @@ langchain-openai==0.3.1
 langchain-google-genai==2.1.4
 
 # Vector DB
-qdrant-client==1.17.0
+qdrant-client==1.19.0
 
 # Graph DB
 neo4j==5.28.0

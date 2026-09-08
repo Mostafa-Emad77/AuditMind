@@ -100,6 +100,7 @@ export function ReconciliationPanel({
 
   const variance = snap?.variance_vs_contract;
   const varianceIsFlag = variance !== null && variance !== undefined && !Number.isNaN(variance) && Math.abs(variance) > 1;
+  const bankIncomplete = snap?.bank_extraction_incomplete === true;
 
   if (!isComplete && isRunning && !report) {
     return (
@@ -119,7 +120,12 @@ export function ReconciliationPanel({
           {[
             { label: "Contract Total", value: formatMoney(snap.contract_total, snap.currency), icon: "receipt_long", variant: "default" },
             { label: "Invoice Total", value: formatMoney(snap.invoice_total, snap.currency), icon: "description", variant: "default" },
-            { label: "Bank Paid Total", value: formatMoney(snap.bank_paid_total, snap.currency), icon: "account_balance", variant: "default" },
+            {
+              label: "Bank Paid Total",
+              value: bankIncomplete ? "Extraction incomplete" : formatMoney(snap.bank_paid_total, snap.currency),
+              icon: "account_balance",
+              variant: bankIncomplete ? "error" : "default",
+            },
             {
               label: "Variance Flagged",
               value: variance === null || variance === undefined
@@ -166,6 +172,23 @@ export function ReconciliationPanel({
           {isComplete
             ? "Insufficient structured data to build a reconciliation snapshot for this audit."
             : "No snapshot yet."}
+        </div>
+      )}
+
+      {bankIncomplete && (
+        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 flex items-start gap-2">
+          <span className="material-symbols-outlined text-[18px] text-red-600 mt-0.5">error</span>
+          <div className="text-[13px] text-red-700">
+            <p className="font-semibold">Bank total withheld — extraction incomplete.</p>
+            <p className="mt-0.5">
+              {snap && snap.bank_debits_verified != null && snap.bank_debits_stated != null
+                ? `Only ${formatMoney(snap.bank_debits_verified, snap.currency)} of ${formatMoney(
+                    snap.bank_debits_stated,
+                    snap.currency
+                  )} in stated bank debits could be verified against the statement. The paid total and variance are hidden until the remaining rows are extracted.`
+                : "Extracted bank debits do not reconcile with the statement's stated Total Debits."}
+            </p>
+          </div>
         </div>
       )}
 

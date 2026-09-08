@@ -10,6 +10,7 @@ from app.models.state import AuditState
 from app.models.schemas import ReasoningStep, Finding
 from app.tools.hybrid_retriever import search_hybrid_rag
 from app.tools.neo4j_tools import detect_graph_contradictions
+from app.services.graph_builder import find_reference_mismatches, find_signatory_mismatches
 from app.services.vector_store import get_all_chunks_for_docs
 from app.services.redis_store import get_suppressed_signatures
 from app.utils.finding_signature import finding_signature
@@ -19,26 +20,40 @@ from app.config import get_settings
 from app.agents.cross_checker.adjudication import _llm_assess_amount_pair, _llm_adjudicate_check
 from app.agents.cross_checker.gates import _accept_finding
 from app.agents.cross_checker.dedup import dedupe_findings
+from app.agents.cross_checker.validation import drop_hallucinated_identifier_findings
 from app.agents.cross_checker.evidence import (
-    _emit, _evidence_line_backs_value, _evidence_snippets_back_values,
-    _graph_context_for_compare, _is_bank_doc, _classify_check_intents,
+    _emit, _evidence_line_backs_value, _graph_context_for_compare, _is_bank_doc, _classify_check_intents,
 )
 
 logger = logging.getLogger(__name__)
 
-# Parallel LLM adjudication (Phase 1 pairs, Phase 2 checklist items). Kept small:
-# the relation model is the expensive one and OpenRouter rate-limits per key.
+# Parallel LLM adjudication; kept small — OpenRouter rate-limits per key.
 _ADJUDICATION_CONCURRENCY = 3
 
 
-class _StepBuffer:
-    """
-    Collects reasoning steps from a concurrent worker instead of streaming them.
+def _dedupe_graph_pairs(contradictions: list[dict]) -> list[dict]:
+    """One row per (numeric pair, reason): duplicates across doc combinations would
+    otherwise crowd real pairs out of the top-N slice."""
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for c in contradictions:
+        v1, v2 = c.get("amount_value1"), c.get("amount_value2")
+        num_key = frozenset({
+            round(float(v1), 2) if v1 is not None else str(c.get("norm1") or "").lower(),
+            round(float(v2), 2) if v2 is not None else str(c.get("norm2") or "").lower(),
+        })
+        key = (num_key, str(c.get("comparison_reason") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    if len(out) < len(contradictions):
+        logger.info("Graph pairs deduplicated: %d → %d", len(contradictions), len(out))
+    return out
 
-    Workers run out of order, but the trace the user sees (and the persisted
-    reasoning_trace) must stay in checklist order — so each worker buffers its
-    steps and the orchestrator flushes them in index order after gathering.
-    """
+
+class _StepBuffer:
+    """Buffers a concurrent worker's steps so the trace can be flushed in checklist order."""
 
     def __init__(self) -> None:
         self._pending: list[tuple[str, str, dict]] = []
@@ -64,9 +79,7 @@ async def cross_checker_agent(state: AuditState) -> dict:
     doc_ids = [doc.doc_id for doc in documents]
     doc_ids_str = ",".join(doc_ids)
 
-    # Every tool below uses a sync driver (Neo4j bolt, Qdrant HTTP) and
-    # search_hybrid_rag can make a sync LLM call inside _extract_query_entities.
-    # Offloading keeps SSE keepalives and other requests responsive during an audit.
+    # Tools use sync drivers; offload so SSE keepalives stay responsive.
     loop = asyncio.get_running_loop()
 
     settings = get_settings()
@@ -79,8 +92,7 @@ async def cross_checker_agent(state: AuditState) -> dict:
     _candidates_total = 0
     _accepted_total = 0
 
-    # False-positive feedback loop: signatures dismissed by reviewers on prior runs
-    # are suppressed here (transparently — we emit a reasoning step when we skip one).
+    # Signatures dismissed by reviewers on prior runs are suppressed (with a trace step).
     try:
         suppressed_signatures = await get_suppressed_signatures(state.get("api_key", "default"))
     except Exception as e:
@@ -108,7 +120,7 @@ async def cross_checker_agent(state: AuditState) -> dict:
             None, detect_graph_contradictions.invoke, {"doc_ids": doc_ids_str}
         )
         graph_data = json.loads(graph_result)
-        contradictions = graph_data.get("contradictions", [])
+        contradictions = _dedupe_graph_pairs(graph_data.get("contradictions", []))
 
         if contradictions:
             step = _emit(writer, "tool_result",
@@ -124,8 +136,9 @@ async def cross_checker_agent(state: AuditState) -> dict:
                 buf = _StepBuffer()
                 raw1 = (c.get("norm1") or c.get("value1") or "").strip()
                 raw2 = (c.get("norm2") or c.get("value2") or "").strip()
-                doc1 = c.get("doc1_name", c.get("doc1_id", "Doc 1"))
-                doc2 = c.get("doc2_name", c.get("doc2_id", "Doc 2"))
+                # Never expose the raw doc_id UUID to the LLM or evidence text.
+                doc1 = c.get("doc1_name") or "Document 1"
+                doc2 = c.get("doc2_name") or "Document 2"
                 page1 = c.get("page1", 0)
                 page2 = c.get("page2", 0)
 
@@ -201,8 +214,7 @@ async def cross_checker_agent(state: AuditState) -> dict:
                          f"{raw1} vs {raw2}")
                 return buf, [], 1
 
-            # Adjudicate the top-10 pairs concurrently, then replay results in the
-            # original (materiality-ordered) sequence so the trace stays deterministic.
+            # Adjudicate top-10 concurrently; replay in materiality order.
             pair_results = await asyncio.gather(
                 *[_adjudicate_pair(c) for c in contradictions[:10]]
             )
@@ -219,14 +231,153 @@ async def cross_checker_agent(state: AuditState) -> dict:
             new_steps.append(step)
 
     except Exception as e:
-        # exc_info: this handler previously hid a NameError for the whole phase.
         logger.warning("Graph contradiction detection failed: %s", e, exc_info=True)
         step = _emit(writer, "thought", f"Graph analysis unavailable ({e}). Continuing with semantic checks.")
         new_steps.append(step)
 
+    # ── Phase 1c: Cross-document self-reference validation ────────────────────
+    # A value one document claims about another vs. that document's own figure.
+    # Deterministic: a disagreeing restatement IS a contradiction — emitted directly.
+    try:
+        reference_rows = await loop.run_in_executor(
+            None, find_reference_mismatches, doc_ids
+        )
+        if reference_rows:
+            step = _emit(writer, "tool_result",
+                         f"Reference validation: {len(reference_rows)} restated value(s) "
+                         "disagree with the document they cite.",
+                         tool_name="find_reference_mismatches",
+                         tool_output=f"{len(reference_rows)} mismatches")
+            new_steps.append(step)
+        for row in reference_rows:
+            claim_doc = row.get("claim_doc_name") or "Document"
+            truth_doc = row.get("truth_doc_name") or "Referenced document"
+            anchor = str(row.get("anchor_value") or "").strip()
+            label = row.get("label", "referenced value")
+            claim_raw = str(row.get("claim_raw") or row.get("claim_value"))
+            truth_raw = str(row.get("truth_raw") or row.get("truth_value"))
+            cv = float(row["claim_value"])
+            tv = float(row["truth_value"])
+            rel = float(row.get("relative_difference") or 0.0)
+            severity = "critical" if (rel >= 0.05 or abs(cv - tv) >= 5000) else "warning"
+            candidate = Finding(
+                severity=severity,
+                title=(
+                    f"{claim_doc} restates {label} of {anchor or truth_doc} as {claim_raw}; "
+                    f"{truth_doc} states {truth_raw}"
+                ),
+                description=(
+                    f"{claim_doc} (page {row.get('claim_page', 0)}) cites {anchor or truth_doc} "
+                    f"with a {label} of {claim_raw}. {truth_doc} itself (page "
+                    f"{row.get('truth_page', 0)}) states {truth_raw}. Difference: "
+                    f"{cv - tv:+,.2f} ({rel:.1%}). A document's reference to another "
+                    f"document must match that document's own stated value."
+                ),
+                confidence_score=0.95,
+                source_doc_id=row.get("claim_doc_id"),
+                source_page=row.get("claim_page", 0),
+                conflicting_doc_id=row.get("truth_doc_id"),
+                conflicting_page=row.get("truth_page", 0),
+                evidence=[
+                    f"{claim_doc}, page {row.get('claim_page', 0)}: {claim_raw}",
+                    f"{truth_doc}, page {row.get('truth_page', 0)}: {truth_raw}",
+                ],
+                recommendation=(
+                    f"Confirm which {label} is correct with the issuing parties and have "
+                    f"{claim_doc} reissued to cite {truth_doc}'s stated figure."
+                ),
+            )
+            _candidates_total += 1
+            accepted, rejection_reason = _accept_finding(
+                candidate, source="detector", **_gate_kwargs
+            )
+            if accepted and _is_suppressed(candidate):
+                step = _emit(writer, "thought",
+                             f"Skipping reference finding suppressed by prior feedback: {claim_raw} vs {truth_raw}")
+                new_steps.append(step)
+                continue
+            if accepted:
+                _accepted_total += 1
+                findings.append(candidate)
+                step = _emit(writer, "finding",
+                             f"REFERENCE MISMATCH: {claim_doc} says {label} = {claim_raw}; "
+                             f"{truth_doc} says {truth_raw}\n"
+                             f"Severity: {severity.upper()} | Confidence: 95%")
+                new_steps.append(step)
+            else:
+                logger.info("Gate rejected reference finding %r: %s",
+                            candidate.title[:60], rejection_reason)
+    except Exception as e:
+        logger.warning("Reference validation failed: %s", e, exc_info=True)
+
+    # ── Phase 1b: Signatory authority mismatches ──────────────────────────────
+    # Narrow by design: only an amendment/successor signed BELOW the original signer's
+    # level. A QS → engineer → PM approval chain is normal, not a mismatch.
+    try:
+        signatory_rows = await loop.run_in_executor(
+            None, find_signatory_mismatches, doc_ids
+        )
+        for row in signatory_rows:
+            n1 = str(row.get("name1") or "").strip()
+            n2 = str(row.get("name2") or "").strip()
+            t1 = str(row.get("title1") or row.get("authority1") or "unknown").strip()
+            t2 = str(row.get("title2") or row.get("authority2") or "unknown").strip()
+            if not n1 or not n2:
+                continue
+            doc1 = row.get("doc1_name") or row.get("doc1_id") or "Doc 1"
+            doc2 = row.get("doc2_name") or row.get("doc2_id") or "Doc 2"
+            signed1 = ", ".join(row.get("signed1") or []) or "unspecified"
+            signed2 = ", ".join(row.get("signed2") or []) or "unspecified"
+            gap = int(row.get("authority_gap") or 0)
+
+            candidate = Finding(
+                severity="warning",
+                title=f"Amendment signed below original authority: {n2} ({t2}) vs {n1} ({t1})",
+                description=(
+                    f"{signed1} was signed by {n1} ({t1}); its stated amendment/successor "
+                    f"{signed2} was signed by {n2} ({t2}), a lower authority level. An "
+                    f"amendment should be approved at or above the authority level of the "
+                    f"original agreement unless delegation of that authority is documented."
+                ),
+                confidence_score=0.7 if gap >= 2 else 0.6,
+                source_doc_id=row.get("doc1_id"),
+                source_page=row.get("page1", 0),
+                conflicting_doc_id=row.get("doc2_id"),
+                conflicting_page=row.get("page2", 0),
+                evidence=[
+                    f"{doc1}: {n1} — {t1} (signed: {signed1})",
+                    f"{doc2}: {n2} — {t2} (signed: {signed2})",
+                ],
+                recommendation=(
+                    "Confirm the signatory held delegated authority for the value and "
+                    "scope of the document they executed, and that any amendment was "
+                    "approved at or above the authority level of the original agreement."
+                ),
+            )
+            _candidates_total += 1
+            accepted, rejection_reason = _accept_finding(
+                candidate, source="graph", **_gate_kwargs
+            )
+            if accepted and _is_suppressed(candidate):
+                step = _emit(writer, "thought",
+                             f"Skipping signatory finding suppressed by prior feedback: {n1} vs {n2}")
+                new_steps.append(step)
+                continue
+            if accepted:
+                _accepted_total += 1
+                findings.append(candidate)
+                step = _emit(writer, "finding",
+                             f"AMENDMENT AUTHORITY MISMATCH: {n2} ({t2}) countersigned "
+                             f"{signed2}; original {signed1} signed by {n1} ({t1})")
+                new_steps.append(step)
+            else:
+                logger.info("Gate rejected signatory finding %r: %s",
+                            candidate.title[:60], rejection_reason)
+    except Exception as e:
+        logger.warning("Signatory mismatch detection failed: %s", e, exc_info=True)
+
     # ── Phase 2: Checklist-driven semantic checks ─────────────────────────────
-    # Pre-fetch all bank-statement chunks once; every bank-reconciliation check below
-    # augments its results with the same full set, so re-fetching per item is wasteful.
+    # Bank chunks fetched once; every bank-recon check appends the full set.
     bank_doc_ids = [d.doc_id for d in documents if _is_bank_doc(d)]
     full_bank_chunks = (
         await loop.run_in_executor(None, get_all_chunks_for_docs, bank_doc_ids)
@@ -242,12 +393,7 @@ async def cross_checker_agent(state: AuditState) -> dict:
         label: str,
         none_message: str,
     ) -> tuple[list[Finding], int]:
-        """
-        Gate, suppress, and narrate one adjudication result set.
-
-        Shared by the amount and date branches, which previously carried ~40 lines
-        of identical accept/suppress/emit logic each.
-        """
+        """Gate, suppress, and narrate one adjudication result set."""
         kept: list[Finding] = []
         for lf in llm_findings:
             accepted, rejection_reason = _accept_finding(lf, source="llm", **_gate_kwargs)
@@ -332,6 +478,13 @@ async def cross_checker_agent(state: AuditState) -> dict:
                     "LLM review found no reliable contradiction for this check.",
                 ))
 
+            if item.check_type == "self_reference":
+                # Handled deterministically in Phase 1c; recorded for the trace.
+                buf.emit("thought",
+                         "Self-reference validation is evaluated deterministically from the "
+                         "knowledge graph (see 'Reference validation' above); no LLM pass needed.")
+                return buf, [], 0
+
             if item.check_type == "date_consistency":
                 async with check_semaphore:
                     llm_findings = await _llm_adjudicate_check(item, results, documents)
@@ -347,8 +500,7 @@ async def cross_checker_agent(state: AuditState) -> dict:
             buf.emit("thought", f"Could not complete check '{item.description[:50]}...': {e}")
             return buf, [], 0
 
-    # Run checklist items concurrently, then replay in checklist order. Deterministic
-    # ordering matters: the Phase-3 dedup loop below is order-sensitive.
+    # Run concurrently, replay in checklist order (Phase-3 dedup is order-sensitive).
     check_results = await asyncio.gather(
         *[_run_check(i, item) for i, item in enumerate(checklist)]
     )
@@ -371,6 +523,17 @@ async def cross_checker_agent(state: AuditState) -> dict:
     if len(deduped) < len(findings):
         logger.info("Deduplicated findings: %d → %d", len(findings), len(deduped))
     findings = deduped
+
+    # ── Phase 3b: Drop findings citing UUIDs not quoted in their evidence ────────
+    findings, _hallucinated = drop_hallucinated_identifier_findings(findings)
+    if _hallucinated:
+        logger.warning(
+            "Dropped %d finding(s) citing unverifiable UUID-format identifiers", _hallucinated,
+        )
+        step = _emit(writer, "thought",
+                     f"Discarded {_hallucinated} finding(s) that referenced an internal "
+                     "identifier not present in any source document.")
+        new_steps.append(step)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     critical = sum(1 for f in findings if f.severity == "critical")

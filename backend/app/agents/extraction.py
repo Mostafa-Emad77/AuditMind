@@ -9,7 +9,7 @@ from langchain_core.messages import AIMessage
 from app.models.state import AuditState
 from app.models.schemas import ReasoningStep, DocumentChunk, DocumentMeta
 from app.services.entity_extractor import extract_entities_from_chunks
-from app.services.vector_store import semantic_search
+from app.services.vector_store import count_chunks_for_docs, semantic_search
 from app.services.graph_builder import (
     store_document_node,
     store_entities,
@@ -20,7 +20,7 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Per-doc-type targeted retrieval queries that complement the broad base query.
+# Doc-type retrieval queries.
 _DOC_TYPE_QUERIES: dict[str, list[str]] = {
     "invoice": [
         "amount date party name contract invoice",
@@ -47,6 +47,21 @@ _DOC_TYPE_QUERIES: dict[str, list[str]] = {
         "audit findings figures cited documents",
         "audit clauses recommendations",
     ],
+    "payment_certificate": [
+        "amount date party name contract invoice",
+        "gross certified amount value of work done retention",
+        "interim payment certificate net payable previously certified",
+    ],
+    "qs_report": [
+        "amount date party name contract invoice",
+        "measured quantities certified milestone valuation rate",
+        "quantity surveyor certification recommended amount",
+    ],
+    "board_resolution": [
+        "amount date party name contract invoice",
+        "board resolved approve payment amount authorised",
+        "meeting minutes directors present signed chairman",
+    ],
 }
 _BASE_QUERIES = [
     "amount date party name contract invoice",
@@ -72,11 +87,7 @@ def _chunk_key(r: dict) -> str:
 
 
 def _retrieve_chunks_for_doc(doc: DocumentMeta, base_k: int, max_k: int) -> list[dict]:
-    """
-    Multi-query adaptive retrieval for a single document.
-    Runs 2-3 targeted queries (depending on doc type), deduplicates by
-    (doc_id, page_num, text prefix hash), and caps at max_k unique chunks.
-    """
+    """2-3 doc-type queries, deduped, capped at max_k chunks."""
     queries = _DOC_TYPE_QUERIES.get(doc.doc_type, _BASE_QUERIES)
     per_query_k = _adaptive_top_k(doc, base_k, max_k)
 
@@ -124,7 +135,6 @@ async def extraction_agent(state: AuditState) -> dict:
         _emit(writer, "extraction", "summary", "No documents to process.")
         return {
             "messages": [AIMessage(content="No documents provided.")],
-            "extraction_complete": False,
             "reasoning_trace": new_steps,
         }
 
@@ -152,12 +162,7 @@ async def extraction_agent(state: AuditState) -> dict:
     loop = asyncio.get_running_loop()
 
     async def _process_doc(doc: DocumentMeta) -> tuple[list, list]:
-        """Retrieve chunks, extract entities/relationships, and persist to Neo4j for one document.
-
-        Qdrant retrieval and Neo4j writes are synchronous network I/O, so they run in the
-        default executor to keep the event loop free. Documents are independent, so callers
-        gather these coroutines to process them concurrently.
-        """
+        """Retrieve → extract → persist one document (sync I/O offloaded)."""
         step = _emit(writer, "extraction", "tool_call",
                      f"Extracting entities from: {doc.filename}",
                      tool_name="extract_entities",
@@ -212,8 +217,7 @@ async def extraction_agent(state: AuditState) -> dict:
             relationships_so_far: int,
             chunk: DocumentChunk,
         ) -> None:
-            # Throttle: emit only every 10th chunk (and the final one) to avoid
-            # flooding the SSE stream on large documents.
+            # Every 10th chunk and the last, to spare the SSE stream.
             if processed % 10 != 0 and processed != total:
                 return
             progress_step = _emit(
@@ -261,27 +265,51 @@ async def extraction_agent(state: AuditState) -> dict:
         all_entities.extend(entities)
         all_relationships.extend(relationships)
 
-    # Linkage trace: surfaces documents whose entities never joined the shared graph.
-    # A doc with entities but zero cross-doc edges can't contribute a cross-document
-    # finding no matter how good the cross-checker is, so name it explicitly here.
+    # Per-document coverage: chunks, entities, cross-doc edges — flags the failing stage.
     try:
-        trace_rows = await loop.run_in_executor(
-            None, trace_document_linkage, [d.doc_id for d in documents]
+        doc_ids_all = [d.doc_id for d in documents]
+        chunk_counts, trace_rows = await asyncio.gather(
+            loop.run_in_executor(None, count_chunks_for_docs, doc_ids_all),
+            loop.run_in_executor(None, trace_document_linkage, doc_ids_all),
         )
-        isolated = [
-            r for r in trace_rows
-            if r.get("entity_count", 0) > 0 and r.get("cross_doc_edges", 0) == 0
-        ]
-        if isolated:
-            names = ", ".join(str(r.get("filename")) for r in isolated)
-            step = _emit(
-                writer, "extraction", "thought",
-                f"Warning: {len(isolated)} document(s) extracted entities but linked to no "
-                f"other document ({names}). They cannot produce cross-document findings.",
+        trace_by_id = {r.get("doc_id"): r for r in trace_rows}
+        lines: list[str] = []
+        problems: list[str] = []
+        for d in documents:
+            t = trace_by_id.get(d.doc_id, {})
+            chunks_n = chunk_counts.get(d.doc_id, -1)
+            ents_n = int(t.get("entity_count", 0) or 0)
+            edges_n = int(t.get("edge_count", 0) or 0)
+            xdoc_n = int(t.get("cross_doc_edges", 0) or 0)
+            flag = ""
+            if chunks_n == 0:
+                flag = "NO CHUNKS STORED (upload/chunking failed)"
+            elif ents_n == 0:
+                flag = "NO ENTITIES (extraction failed)"
+            elif xdoc_n == 0:
+                flag = "ISOLATED (no edge to any other document — cannot produce cross-document findings)"
+            line = (
+                f"{d.filename} [{d.doc_type}]: {chunks_n} chunks, {ents_n} entities, "
+                f"{edges_n} edges ({xdoc_n} cross-document)"
             )
-            new_steps.append(step)
+            lines.append(f"{line} — ⚠ {flag}" if flag else f"{line} ✓")
+            if flag:
+                problems.append(d.filename)
+                logger.warning("Document coverage — %s: %s", d.filename, flag)
+            else:
+                logger.info("Document coverage — %s", line)
+        step = _emit(
+            writer, "extraction", "tool_result",
+            "Document coverage:\n" + "\n".join(f"  {ln}" for ln in lines),
+            tool_name="document_coverage",
+            tool_output=(
+                f"{len(documents) - len(problems)}/{len(documents)} documents fully covered"
+                + (f"; problems: {', '.join(problems)}" if problems else "")
+            ),
+        )
+        new_steps.append(step)
     except Exception as e:
-        logger.debug("Linkage trace skipped: %s", e)
+        logger.warning("Document coverage report failed: %s", e, exc_info=True)
 
     # Summary
     summary = (
@@ -294,6 +322,5 @@ async def extraction_agent(state: AuditState) -> dict:
 
     return {
         "messages": [AIMessage(content=summary)],
-        "extraction_complete": True,
         "reasoning_trace": new_steps,
     }

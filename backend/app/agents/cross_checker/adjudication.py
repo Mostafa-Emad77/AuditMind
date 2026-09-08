@@ -24,6 +24,10 @@ async def _llm_assess_amount_pair(
     prompt = (
         "You are a forensic audit checker. Decide if two numeric values are a REAL contradiction.\n"
         "You MUST reject apples-to-oranges comparisons.\n\n"
+        "REFERENCE NUMBERS: Only cite reference numbers, contract IDs, or document numbers that\n"
+        "appear as literal visible text in the evidence below. Never reference, compare against,\n"
+        "or flag as 'missing' an identifier that is not directly quoted from a source document.\n"
+        "Internal system identifiers (UUIDs, session IDs, audit IDs) must never appear in your output.\n\n"
         "Reject comparison if any of these apply:\n"
         "- one value is opening/closing balance and the other is invoice/contract total\n"
         "- one value is a single payment installment and the other is a full total\n"
@@ -95,7 +99,7 @@ async def _llm_adjudicate_check(
         seen.add(key)
         snippets.append({
             "doc_id": doc_id,
-            "doc_name": getattr(by_doc.get(doc_id), "filename", doc_id[:8]),
+            "doc_name": getattr(by_doc.get(doc_id), "filename", f"document {len(snippets) + 1}"),
             "doc_type": (getattr(by_doc.get(doc_id), "doc_type", "") or "unknown"),
             "page": int(r.get("page", 0) or 0),
             "text": text[:900],
@@ -105,11 +109,20 @@ async def _llm_adjudicate_check(
     if len(snippets) < 2:
         return []
 
+    # Raw doc_id UUIDs never reach the prompt (the model echoes them as fake refs).
+    prompt_snippets = [
+        {k: v for k, v in s.items() if k != "doc_id"} for s in snippets
+    ]
+
     llm = get_llm(temperature=0.0, role="relation")
     prompt = (
         "You are a strict financial audit reviewer.\n"
         "Analyze the checklist check against document snippets and output ONLY real findings.\n"
         "Do NOT compare apples-to-oranges (partial payment vs full total, opening balance vs invoice total, etc).\n"
+        "REFERENCE NUMBERS: Only cite reference numbers, contract IDs, or document numbers that appear as\n"
+        "literal visible text within the provided snippets. Never reference, compare against, or flag as\n"
+        "'missing' any identifier that is not directly quoted from a snippet. Internal system metadata\n"
+        "(UUIDs, session IDs, audit IDs) must never appear in a finding's title, description, or recommendation.\n"
         "Prefer like-with-like reconciliations: total paid vs contract total vs invoice total; schedule amounts vs milestone payments.\n\n"
         "ADVANCE PAYMENT — avoid false-positive warnings:\n"
         "- If snippets show the contract payment schedule explicitly includes an advance payment "
@@ -127,7 +140,7 @@ async def _llm_adjudicate_check(
         "output a single clearest critical finding instead of multiple near-duplicate titles.\n\n"
         f"Checklist item: {item.description}\n"
         f"Check type: {item.check_type}\n"
-        f"Snippets (indexed): {json.dumps(snippets, ensure_ascii=False)}\n\n"
+        f"Snippets (indexed): {json.dumps(prompt_snippets, ensure_ascii=False)}\n\n"
         "Return JSON only:\n"
         "{\n"
         "  \"findings\": [\n"

@@ -10,20 +10,8 @@ def _accept_finding(
     min_confidence_llm: float = 0.65,
     min_confidence_graph: float = 0.55,
 ) -> tuple[bool, str]:
-    """
-    Centralized precision-first acceptance gate for all finding paths.
-
-    Args:
-        finding: The candidate Finding to evaluate.
-        source: "llm" for LLM-adjudicated, "graph" for graph-contradiction, "detector" for rule-based.
-        min_evidence_for_critical: Min distinct evidence snippets required for critical LLM findings.
-        min_confidence_llm: Min confidence for LLM-sourced findings.
-        min_confidence_graph: Min confidence for graph-sourced findings.
-
-    Returns:
-        (accepted: bool, rejection_reason: str)
-        rejection_reason is empty string if accepted.
-    """
+    """Precision gate for every finding path. source: llm | graph | detector.
+    Returns (accepted, rejection_reason)."""
     # ok-severity findings are observational — always let through
     if finding.severity == "ok":
         return True, ""

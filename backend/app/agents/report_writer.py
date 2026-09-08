@@ -1,10 +1,9 @@
 """Report Writer Agent — generates the final structured audit report."""
 import json
 import logging
-from datetime import datetime
 
 from langgraph.config import get_stream_writer
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate
 
 from app.models.state import AuditState
@@ -27,12 +26,13 @@ Structure the report as JSON with this exact schema:
   "recommendations": ["list of actionable recommendations"],
   "overall_risk": "critical|high|medium|low|clean"
 }}"""),
-    ("human", """Audit Session ID: {audit_id}
-Documents: {documents}
+    ("human", """Documents: {documents}
 Findings ({count} total):
 {findings_json}
 
 Report language: English
+Only cite document/contract/invoice numbers that appear literally in the findings text above.
+Never output internal identifiers (UUIDs, session IDs).
 Generate the audit report now."""),
 ])
 
@@ -49,12 +49,13 @@ _REPORT_PROMPT_AR = ChatPromptTemplate.from_messages([
   "recommendations": ["قائمة من التوصيات القابلة للتنفيذ"],
   "overall_risk": "critical|high|medium|low|clean"
 }}"""),
-    ("human", """معرف جلسة المراجعة: {audit_id}
-المستندات: {documents}
+    ("human", """المستندات: {documents}
 النتائج ({count} إجمالي):
 {findings_json}
 
 لغة التقرير: العربية
+لا تذكر إلا أرقام المستندات/العقود/الفواتير الواردة حرفيًا في النتائج أعلاه.
+لا تُخرج أي معرفات داخلية (UUID، معرفات الجلسة).
 قم بإنشاء تقرير المراجعة الآن."""),
 ])
 
@@ -138,7 +139,6 @@ async def report_writer_agent(state: AuditState) -> dict:
         chain = prompt | llm
 
         response = await chain.ainvoke({
-            "audit_id": audit_id,
             "documents": ", ".join(doc_names),
             "count": len(findings),
             "findings_json": json.dumps(findings_summary, ensure_ascii=False, indent=2),

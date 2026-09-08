@@ -1,12 +1,13 @@
 """Build and query the Neo4j knowledge graph from extracted entities and relationships."""
 import logging
-from collections import defaultdict, deque
-from typing import Any, Optional
+import re
+from typing import Optional
 
 from neo4j import GraphDatabase, Driver
 
 from app.config import get_settings
-from app.models.schemas import Entity, Relationship, DocumentMeta, GraphData, GraphNode, GraphEdge
+from app.models.schemas import Entity, Relationship, DocumentMeta
+from app.utils.canonical_id import normalize_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -70,15 +71,8 @@ def init_graph_schema() -> None:
 
 
 def delete_audit_documents(doc_ids: list[str]) -> None:
-    """
-    Remove Document nodes for an audit and prune entities that no longer belong
-    to any remaining document.
-
-    Only the FOUND_IN edges for the given docs are deleted (not the entities
-    themselves), because global-dedupe entity types (company, contract_id, ...)
-    can be shared across multiple audits' documents via canonical IDs. An entity
-    is only DETACH DELETEd once it has no remaining FOUND_IN edge to any document.
-    """
+    """Delete the audit's Document nodes; entities go only once no FOUND_IN edge
+    remains (global-dedupe entities are shared across audits)."""
     if not doc_ids:
         return
     settings = get_settings()
@@ -152,6 +146,8 @@ def store_entities(entities: list[Entity]) -> None:
             "numeral_mismatch": getattr(e, "numeral_mismatch", None),
             "amount_value": getattr(e, "amount_value", None),
             "amount_currency": getattr(e, "amount_currency", None),
+            "txn_ref": getattr(e, "txn_ref", None),
+            "txn_date": getattr(e, "txn_date", None),
             "role_title": getattr(e, "role_title", None),
             "signing_authority_level": getattr(e, "signing_authority_level", None),
             "document_signed": getattr(e, "document_signed", None),
@@ -180,6 +176,8 @@ def store_entities(entities: list[Entity]) -> None:
                     e.numeral_mismatch = rec.numeral_mismatch,
                     e.amount_value = rec.amount_value,
                     e.amount_currency = rec.amount_currency,
+                    e.txn_ref = rec.txn_ref,
+                    e.txn_date = rec.txn_date,
                     e.role_title = rec.role_title,
                     e.signing_authority_level = rec.signing_authority_level,
                     e.documents_signed = CASE
@@ -210,13 +208,13 @@ def store_entities(entities: list[Entity]) -> None:
                     e.arabic_indic_numeral_form = coalesce(e.arabic_indic_numeral_form, rec.arabic_indic_numeral_form),
                     e.amount_value = coalesce(e.amount_value, rec.amount_value),
                     e.amount_currency = coalesce(e.amount_currency, rec.amount_currency),
+                    e.txn_ref = coalesce(e.txn_ref, rec.txn_ref),
+                    e.txn_date = coalesce(e.txn_date, rec.txn_date),
                     e.role_title = coalesce(e.role_title, rec.role_title),
                     e.signing_authority_level = coalesce(
                         e.signing_authority_level, rec.signing_authority_level
                     ),
-                    // Person nodes dedupe globally, so one signatory seen across several
-                    // documents accumulates everything they signed — that list is what
-                    // makes signatory/authority mismatches detectable.
+                    // Person nodes dedupe globally; accumulate everything they signed.
                     e.documents_signed = CASE
                         WHEN rec.document_signed IS NULL
                             THEN coalesce(e.documents_signed, [])
@@ -277,19 +275,10 @@ def store_relationships(relationships: list[Relationship]) -> None:
     _run_with_reconnect(_run)
 
 
-# Explicit allow-list of amount-role pairs that are meaningful to compare, each with a
-# human-readable reason explaining WHY the two are comparable. The reason is surfaced as
-# the conflict_type on exported rows, so a reviewer sees "contract total vs invoice's
-# stated contract value" instead of an opaque "Doc A vs Doc B".
-#
-# Pairs are declared once, unordered; the symmetric lookup is built below. Anything not
-# listed here is NOT compared — co-occurring in a chunk or sharing a document ID is
-# explicitly not sufficient grounds to compare two amounts.
+# Allow-list of comparable amount-role pairs with the reason shown in the report.
 _COMPARABLE_ROLE_REASONS: dict[frozenset[str], str] = {
     frozenset({"total_contract_value", "total_invoice"}):
         "contract total vs invoice total",
-    # The restatement check: an invoice asserting a different contract value than the
-    # contract itself states is a real finding, which is why these carry distinct roles.
     frozenset({"total_contract_value", "invoice_referenced_contract_value"}):
         "contract total vs invoice's stated contract reference",
     frozenset({"total_contract_value"}):
@@ -310,22 +299,10 @@ _COMPARABLE_ROLE_REASONS: dict[frozenset[str], str] = {
         "retainer rate vs bank payment",
     frozenset({"transaction_debit"}):
         "bank payment vs bank payment",
-    # Legacy `single_payment` (pre debit/credit split) kept comparable so historical
-    # graph data keeps producing findings.
-    frozenset({"single_payment"}):
-        "bank payment vs bank payment",
-    frozenset({"milestone_scheduled", "single_payment"}):
-        "scheduled milestone vs bank payment",
-    frozenset({"retainer", "single_payment"}):
-        "retainer rate vs bank payment",
-    # NOTE: invoice_total vs an individual payment is deliberately NOT here. An invoice
-    # is legitimately settled by several installments, so it must be reconciled against
-    # the SUM of payments (see reconciliation_payload), never pairwise against one debit.
+    # invoice_total vs single payment excluded: reconcile against the SUM instead.
 }
 
-# Roles that must never participate in a contradiction comparison: cumulative account
-# state and pre-aggregated statement totals are not transaction values, so comparing
-# them against line items is meaningless by construction.
+# Cumulative account state / pre-aggregated totals — never comparable to a line item.
 _INCOMPATIBLE_ROLES: frozenset[str] = frozenset({
     "opening_balance",
     "closing_balance",
@@ -335,16 +312,20 @@ _INCOMPATIBLE_ROLES: frozenset[str] = frozenset({
 })
 
 
+# Rate-like roles compare without a shared anchor; totals stay anchor-required.
+_ANCHORLESS_SAME_ROLE_PAIRS: frozenset[str] = frozenset({
+    "retainer",
+    "milestone_scheduled",
+})
+
+
 def _role_pair_key(role1: str, role2: str) -> str:
     """Order-independent "a|b" key for a role pair, matching _COMPARABLE_PAIR_KEYS."""
     a, b = sorted((role1, role2))
     return f"{a}|{b}"
 
 
-# The allow-list flattened into sortable string keys so the SAME rule can be applied
-# inside Cypher. This matters because LIMIT runs in the database: filtering roles only
-# in Python let high-materiality but incomparable pairs consume the row budget and
-# push genuine findings out of the result set entirely.
+# Allow-list as sortable "a|b" keys so Cypher applies it before LIMIT.
 _COMPARABLE_PAIR_KEYS: list[str] = sorted({
     _role_pair_key(*(tuple(pair) * 2 if len(pair) == 1 else tuple(pair)))
     for pair in _COMPARABLE_ROLE_REASONS
@@ -357,9 +338,7 @@ def _role_pair_reason(role1: str, role2: str) -> str | None:
     r2 = (role2 or "unknown").strip().lower()
     if r1 in _INCOMPATIBLE_ROLES or r2 in _INCOMPATIBLE_ROLES:
         return None
-    # `unknown` used to pass through as comparable, which — combined with untagged
-    # running balances — is what produced conflicts like "running balance 750,000 vs
-    # line item 25,000". An unclassified amount is no longer grounds for comparison.
+    # An unclassified amount is not grounds for comparison.
     if r1 == "unknown" or r2 == "unknown":
         return None
     return _COMPARABLE_ROLE_REASONS.get(frozenset({r1, r2}))
@@ -371,20 +350,7 @@ def _roles_are_comparable(role1: str, role2: str) -> bool:
 
 
 def find_contradictions(doc_ids: list[str]) -> list[dict]:
-    """
-    Find amount contradictions across documents.
-
-    Only pairs of amount entities that share a non-amount anchor (contract, invoice,
-    party, etc.) via RELATES are considered — not arbitrary shortest-path neighbors.
-
-    Each unordered pair is returned once (the match is symmetric, so without the
-    entity_id ordering constraint every pair came back twice), ordered by relative
-    amount difference so the callers' top-N are the most material discrepancies.
-
-    Results include amount_role; incomparable role pairs are filtered out with
-    `_roles_are_comparable` before returning.
-    Pairs where one entity is an opening/closing balance are excluded at query time.
-    """
+    """Cross-document amount pairs sharing an anchor, role-filtered, by relative difference."""
     settings = get_settings()
 
     def _run(driver: Driver):
@@ -395,30 +361,24 @@ def find_contradictions(doc_ids: list[str]) -> list[dict]:
                 MATCH (e2:Entity)-[:FOUND_IN]->(d2:Document)
                 WHERE e1.entity_type = 'amount'
                   AND e2.entity_type = 'amount'
-                  // Unordered pairs: the match is symmetric, so keep one direction only.
+                  // Symmetric match: keep one direction only.
                   AND e1.entity_id < e2.entity_id
                   AND d1.doc_id <> d2.doc_id
                   AND d1.doc_id IN $doc_ids
                   AND d2.doc_id IN $doc_ids
-                  // Cumulative balances and pre-aggregated statement totals are not
-                  // transaction values — excluded here so they never reach the LLM.
                   AND NOT coalesce(e1.amount_role, 'unknown') IN $excluded_roles
                   AND NOT coalesce(e2.amount_role, 'unknown') IN $excluded_roles
-                  // Apply the role allow-list HERE, before ORDER BY/LIMIT. Filtering it
-                  // only in Python let incomparable pairs occupy the LIMIT budget and
-                  // silently drop real findings that ranked below them.
+                  // Role allow-list applied here, before ranking.
                   AND (CASE
                         WHEN coalesce(e1.amount_role, 'unknown') < coalesce(e2.amount_role, 'unknown')
                           THEN coalesce(e1.amount_role, 'unknown') + '|' + coalesce(e2.amount_role, 'unknown')
                           ELSE coalesce(e2.amount_role, 'unknown') + '|' + coalesce(e1.amount_role, 'unknown')
                       END) IN $comparable_pairs
-                  // Currency must match when both are known (USD vs EGP is not a contradiction).
                   AND (
                        e1.amount_currency IS NULL
                     OR e2.amount_currency IS NULL
                     OR e1.amount_currency = e2.amount_currency
                   )
-                  // Distinct amounts: prefer numeric compare with tolerance; fall back to string.
                   AND (
                     (e1.amount_value IS NOT NULL AND e2.amount_value IS NOT NULL
                        AND abs(e1.amount_value - e2.amount_value) >
@@ -430,8 +390,15 @@ def find_contradictions(doc_ids: list[str]) -> list[dict]:
                     ((e1.amount_value IS NULL OR e2.amount_value IS NULL)
                        AND e1.normalized_value <> e2.normalized_value)
                   )
-                MATCH (e1)-[:RELATES]-(anchor:Entity)-[:RELATES]-(e2)
+                // Anchor optional for rate-like roles (see _ANCHORLESS_SAME_ROLE_PAIRS).
+                OPTIONAL MATCH (e1)-[:RELATES]-(anchor:Entity)-[:RELATES]-(e2)
                 WHERE anchor.entity_type <> 'amount'
+                WITH e1, e2, d1, d2, anchor
+                WHERE anchor IS NOT NULL
+                   OR (
+                        coalesce(e1.amount_role, 'unknown') = coalesce(e2.amount_role, 'unknown')
+                        AND coalesce(e1.amount_role, 'unknown') IN $anchorless_roles
+                      )
                 RETURN e1.entity_id AS entity1_id,
                        e2.entity_id AS entity2_id,
                        e1.value AS value1,
@@ -468,15 +435,13 @@ def find_contradictions(doc_ids: list[str]) -> list[dict]:
                 doc_ids=doc_ids,
                 excluded_roles=sorted(_INCOMPATIBLE_ROLES),
                 comparable_pairs=_COMPARABLE_PAIR_KEYS,
+                anchorless_roles=sorted(_ANCHORLESS_SAME_ROLE_PAIRS),
             )
             return [dict(r) for r in result]
 
     rows = _run_with_reconnect(_run)
 
-    # Apply the full role-compatibility allow-list. The Cypher only drops the
-    # never-comparable roles; this rejects pairs like retainer vs total_contract_value
-    # that would otherwise reach the LLM and burn an adjudication call each. The
-    # matched reason rides along so the report can say why the pair was compared.
+    # Re-apply allow-list and attach the reason.
     kept: list[dict] = []
     for r in rows:
         reason = _role_pair_reason(r.get("role1"), r.get("role2"))
@@ -492,300 +457,93 @@ def find_contradictions(doc_ids: list[str]) -> list[dict]:
     return kept
 
 
-_GLOBAL_DEDUPE_TYPES = {"contract_id", "invoice_id", "company", "person"}
+# Self-reference validation: claim role → (authoritative role, doc_type, label).
+_REFERENCE_CLAIMS: dict[str, tuple[str, str, str]] = {
+    # claim role → (authoritative role, authoritative doc_type, human label)
+    "invoice_referenced_contract_value": ("total_contract_value", "contract", "contract value"),
+}
 
 
-def _canonical_entity_key(row: dict[str, Any]) -> str:
-    e_type = (row.get("entity_type") or row.get("node_type") or "other").strip().lower()
-    norm = (
-        row.get("normalized_value")
-        or row.get("properties", {}).get("normalized_value")
-        or row.get("value")
-        or row.get("label")
-        or row.get("entity_id")
-        or row.get("id")
-        or ""
-    ).strip().lower()
-    if e_type in _GLOBAL_DEDUPE_TYPES:
-        return f"{e_type}:{norm}"
-    return f"{e_type}:{row.get('doc_id', '')}:{norm}"
-
-
-def _pick_center_node(nodes: list[GraphNode], edges: list[GraphEdge], requested: Optional[str]) -> Optional[str]:
-    by_id = {n.id: n for n in nodes}
-    if requested and requested in by_id:
-        return requested
-    if not nodes:
-        return None
-
-    def _degree(n_id: str) -> int:
-        return sum(1 for e in edges if e.source == n_id or e.target == n_id)
-
-    for n in nodes:
-        n.degree = _degree(n.id)
-
-    typed = [n for n in nodes if n.node_type in {"contract_id", "invoice_id"}]
-    if typed:
-        return max(typed, key=lambda n: n.degree).id
-
-    docs = [n for n in nodes if n.node_type == "document"]
-    if docs:
-        return max(docs, key=lambda n: n.degree).id
-
-    return max(nodes, key=lambda n: n.degree).id
-
-
-def _apply_center_depth(graph: GraphData, center_node: Optional[str], depth: int) -> GraphData:
-    if not center_node or depth < 1:
-        return graph
-
-    node_ids = {n.id for n in graph.nodes}
-    if center_node not in node_ids:
-        return graph
-
-    adj: dict[str, set[str]] = defaultdict(set)
-    for e in graph.edges:
-        adj[e.source].add(e.target)
-        adj[e.target].add(e.source)
-
-    keep: set[str] = {center_node}
-    q: deque[tuple[str, int]] = deque([(center_node, 0)])
-    while q:
-        nid, d = q.popleft()
-        if d >= depth:
-            continue
-        for nxt in adj.get(nid, set()):
-            if nxt not in keep:
-                keep.add(nxt)
-                q.append((nxt, d + 1))
-
-    nodes = [n for n in graph.nodes if n.id in keep]
-    edges = [e for e in graph.edges if e.source in keep and e.target in keep]
-    for n in nodes:
-        n.is_center = n.id == center_node
-    return GraphData(nodes=nodes, edges=edges, center_node=center_node, view=graph.view)
-
-
-def _canonicalize_graph(raw_nodes: list[dict[str, Any]], raw_edges: list[dict[str, Any]]) -> GraphData:
-    documents: list[GraphNode] = []
-    entity_rows = [n for n in raw_nodes if n.get("node_type") != "document"]
-
-    for d in [n for n in raw_nodes if n.get("node_type") == "document"]:
-        documents.append(GraphNode(
-            id=d["id"],
-            label=d.get("label", d["id"]),
-            node_type="document",
-            doc_id=d["id"],
-            raw_ids=[d["id"]],
-            properties=d.get("properties", {}),
-        ))
-
-    grouped: dict[str, dict[str, Any]] = {}
-    raw_to_canon: dict[str, str] = {}
-
-    for row in entity_rows:
-        key = _canonical_entity_key(row)
-        canon_id = f"ent::{key}"
-        raw_id = row["id"]
-        raw_to_canon[raw_id] = canon_id
-
-        g = grouped.setdefault(canon_id, {
-            "id": canon_id,
-            "label": row.get("label") or row.get("properties", {}).get("normalized_value", raw_id),
-            "node_type": row.get("node_type", "other"),
-            "doc_ids": set(),
-            "pages": set(),
-            "normalized_values": set(),
-            "raw_ids": [],
-            "mention_count": 0,
-        })
-        g["mention_count"] += 1
-        g["raw_ids"].append(raw_id)
-        if row.get("doc_id"):
-            g["doc_ids"].add(row["doc_id"])
-        page = row.get("properties", {}).get("source_page")
-        if isinstance(page, int) and page > 0:
-            g["pages"].add(page)
-        nval = row.get("properties", {}).get("normalized_value")
-        if nval:
-            g["normalized_values"].add(str(nval))
-        # Prefer shortest non-empty label to avoid noisy long OCR values.
-        curr = row.get("label", "")
-        if curr and len(curr) < len(g["label"]):
-            g["label"] = curr
-
-    nodes: list[GraphNode] = documents[:]
-    for g in grouped.values():
-        doc_ids = sorted(g["doc_ids"])
-        node_doc_id = doc_ids[0] if len(doc_ids) == 1 else None
-        nodes.append(GraphNode(
-            id=g["id"],
-            label=g["label"],
-            node_type=g["node_type"],
-            doc_id=node_doc_id,
-            mention_count=g["mention_count"],
-            raw_ids=g["raw_ids"],
-            properties={
-                "normalized_values": sorted(g["normalized_values"]),
-                "source_docs": doc_ids,
-                "pages": sorted(g["pages"]),
-            },
-        ))
-
-    agg: dict[tuple[str, str, str], GraphEdge] = {}
-
-    for e in raw_edges:
-        src = e.get("source")
-        tgt = e.get("target")
-        rel = e.get("relationship", "other")
-        src_id = raw_to_canon.get(src, src)
-        tgt_id = raw_to_canon.get(tgt, tgt)
-        if src_id == tgt_id:
-            continue
-        key = (src_id, tgt_id, rel)
-        if key not in agg:
-            agg[key] = GraphEdge(
-                source=src_id,
-                target=tgt_id,
-                relationship=rel,
-                count=1,
-                is_contradiction=bool(e.get("is_contradiction", False)),
-                properties=e.get("properties", {}),
-            )
-        else:
-            agg[key].count += 1
-            agg[key].is_contradiction = agg[key].is_contradiction or bool(e.get("is_contradiction", False))
-
-    # Build canonical FOUND_IN edges from grouped metadata (stable and deduped).
-    for g in grouped.values():
-        for d_id in g["doc_ids"]:
-            key = (g["id"], d_id, "found_in")
-            if key not in agg:
-                agg[key] = GraphEdge(source=g["id"], target=d_id, relationship="found_in", count=1)
-            else:
-                agg[key].count += 1
-
-    return GraphData(nodes=nodes, edges=list(agg.values()), view="canonical")
-
-
-def get_entity_graph(
-    doc_ids: list[str],
-    center_node: Optional[str] = None,
-    depth: int = 1,
-    view: str = "canonical",
-) -> GraphData:
-    """Retrieve nodes + edges for visualization, optionally canonicalized and center-filtered."""
+def find_reference_mismatches(doc_ids: list[str]) -> list[dict]:
+    """Values a document asserts about another vs. that document's own figure,
+    via their shared identifier. Deterministic; one row per mismatch."""
+    if not doc_ids:
+        return []
     settings = get_settings()
-    raw_nodes: list[dict[str, Any]] = []
-    raw_edges: list[dict[str, Any]] = []
+    claim_roles = sorted(_REFERENCE_CLAIMS)
 
     def _run(driver: Driver):
         with driver.session(database=settings.neo4j_database) as session:
-            for record in session.run(
-                "MATCH (d:Document) WHERE d.doc_id IN $doc_ids RETURN d",
-                doc_ids=doc_ids,
-            ):
-                d = record["d"]
-                raw_nodes.append({
-                    "id": d["doc_id"],
-                    "label": d.get("filename", d["doc_id"]),
-                    "node_type": "document",
-                    "doc_id": d["doc_id"],
-                    "properties": {"doc_type": d.get("doc_type", ""), "language": d.get("language", "")},
-                })
-
-            for record in session.run(
+            result = session.run(
                 """
-                MATCH (e:Entity)-[:FOUND_IN]->(d:Document)
-                WHERE d.doc_id IN $doc_ids
-                RETURN e.entity_id AS entity_id,
-                       e.value AS value,
-                       e.entity_type AS entity_type,
-                       e.normalized_value AS normalized_value,
-                       e.source_page AS source_page,
-                       d.doc_id AS doc_id
-                LIMIT 500
+                MATCH (claim:Entity)-[:FOUND_IN]->(cd:Document)
+                WHERE cd.doc_id IN $doc_ids
+                  AND claim.entity_type = 'amount'
+                  AND claim.amount_role IN $claim_roles
+                  AND claim.amount_value IS NOT NULL
+                MATCH (claim)-[:RELATES]-(anchor:Entity)
+                WHERE anchor.entity_type IN ['contract_id', 'invoice_id']
+                MATCH (anchor)-[:RELATES]-(truth:Entity)-[:FOUND_IN]->(td:Document)
+                WHERE td.doc_id IN $doc_ids
+                  AND td.doc_id <> cd.doc_id
+                  AND truth.entity_type = 'amount'
+                  AND truth.amount_value IS NOT NULL
+                RETURN claim.amount_role AS claim_role,
+                       claim.amount_value AS claim_value,
+                       claim.value AS claim_raw,
+                       claim.amount_currency AS claim_currency,
+                       coalesce(claim.source_page, 0) AS claim_page,
+                       cd.doc_id AS claim_doc_id,
+                       cd.filename AS claim_doc_name,
+                       cd.doc_type AS claim_doc_type,
+                       anchor.value AS anchor_value,
+                       anchor.entity_type AS anchor_type,
+                       truth.amount_role AS truth_role,
+                       truth.amount_value AS truth_value,
+                       truth.value AS truth_raw,
+                       truth.amount_currency AS truth_currency,
+                       coalesce(truth.source_page, 0) AS truth_page,
+                       td.doc_id AS truth_doc_id,
+                       td.filename AS truth_doc_name,
+                       td.doc_type AS truth_doc_type
                 """,
                 doc_ids=doc_ids,
-            ):
-                row = dict(record)
-                raw_nodes.append({
-                    "id": row["entity_id"],
-                    "label": row.get("value", ""),
-                    "node_type": row.get("entity_type", "other"),
-                    "doc_id": row.get("doc_id"),
-                    "properties": {
-                        "normalized_value": row.get("normalized_value", ""),
-                        "source_page": row.get("source_page", 0),
-                    },
-                })
+                claim_roles=claim_roles,
+            )
+            return [dict(r) for r in result]
 
-            for record in session.run(
-                """
-                MATCH (e1:Entity)-[r:RELATES]->(e2:Entity)
-                WHERE e1.source_doc_id IN $doc_ids AND e2.source_doc_id IN $doc_ids
-                RETURN e1.entity_id AS src, e2.entity_id AS tgt,
-                       r.relationship_type AS rel_type
-                LIMIT 800
-                """,
-                doc_ids=doc_ids,
-            ):
-                raw_edges.append({
-                    "source": record["src"],
-                    "target": record["tgt"],
-                    "relationship": record["rel_type"],
-                })
+    try:
+        rows = _run_with_reconnect(_run)
+    except Exception as e:
+        logger.warning("Reference mismatch query failed: %s", e)
+        return []
 
-            for record in session.run(
-                """
-                MATCH (e:Entity)-[:FOUND_IN]->(d:Document)
-                WHERE d.doc_id IN $doc_ids
-                RETURN e.entity_id AS src, d.doc_id AS tgt
-                LIMIT 500
-                """,
-                doc_ids=doc_ids,
-            ):
-                raw_edges.append({
-                    "source": record["src"],
-                    "target": record["tgt"],
-                    "relationship": "found_in",
-                })
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for r in rows:
+        truth_role, truth_doc_type, label = _REFERENCE_CLAIMS[r["claim_role"]]
+        # Only the referenced document's own figure is the truth (not echoes elsewhere).
+        if r.get("truth_role") != truth_role or r.get("truth_doc_type") != truth_doc_type:
+            continue
+        cur_c = (r.get("claim_currency") or "").upper()
+        cur_t = (r.get("truth_currency") or "").upper()
+        if cur_c and cur_t and cur_c != cur_t:
+            continue
+        cv, tv = float(r["claim_value"]), float(r["truth_value"])
+        if abs(cv - tv) <= max(1.0, abs(tv) * 0.0001):
+            continue  # restatement matches — nothing to report
+        key = (r["claim_doc_id"], round(cv, 2), r["truth_doc_id"], round(tv, 2))
+        if key in seen:
+            continue
+        seen.add(key)
+        r["label"] = label
+        r["difference"] = round(cv - tv, 2)
+        r["relative_difference"] = abs(cv - tv) / max(abs(tv), 1.0)
+        out.append(r)
 
-    _run_with_reconnect(_run)
-
-    if view == "raw":
-        graph = GraphData(
-            nodes=[
-                GraphNode(
-                    id=n["id"],
-                    label=n["label"],
-                    node_type=n["node_type"],
-                    doc_id=n.get("doc_id"),
-                    raw_ids=[n["id"]],
-                    properties=n.get("properties", {}),
-                )
-                for n in raw_nodes
-            ],
-            edges=[
-                GraphEdge(
-                    source=e["source"],
-                    target=e["target"],
-                    relationship=e.get("relationship", "other"),
-                    is_contradiction=bool(e.get("is_contradiction", False)),
-                    properties=e.get("properties", {}),
-                )
-                for e in raw_edges
-            ],
-            view="raw",
-        )
-    else:
-        graph = _canonicalize_graph(raw_nodes, raw_edges)
-
-    resolved_center = _pick_center_node(graph.nodes, graph.edges, center_node)
-    for n in graph.nodes:
-        n.is_center = n.id == resolved_center
-    graph.center_node = resolved_center
-    return _apply_center_depth(graph, resolved_center, max(1, depth))
+    if out:
+        logger.info("Reference validation: %d restated value(s) disagree with source", len(out))
+    return out
 
 
 def query_graph_for_entities(query_entities: list[str], doc_ids: list[str], depth: int = 2) -> list[dict]:
@@ -835,15 +593,7 @@ def query_graph_for_entities(query_entities: list[str], doc_ids: list[str], dept
 
 
 def trace_document_linkage(doc_ids: list[str]) -> list[dict]:
-    """
-    Per-document diagnostic: how many entities each document contributed, and how many
-    graph edges actually touch them.
-
-    A document showing entities > 0 but cross_doc_edges == 0 is the signature of an
-    entity-resolution failure: its entities exist but never linked to the shared nodes
-    (same contract number, same vendor) that the cross-checker traverses — so it can
-    never contribute a cross-document finding.
-    """
+    """Per-document entity/edge counts; entities > 0 with 0 cross-doc edges = isolated."""
     if not doc_ids:
         return []
     settings = get_settings()
@@ -904,3 +654,143 @@ def trace_document_linkage(doc_ids: list[str]) -> list[dict]:
         else:
             logger.info(msg, *args)
     return rows
+
+
+# Describes a gap ("CFO vs Chairman"); not a signing policy.
+_AUTHORITY_RANK: dict[str, int] = {
+    "chairman": 5,
+    "ceo": 4,
+    "cfo": 3,
+    "director": 2,
+    "manager": 1,
+    "other": 0,
+    "unknown": 0,
+}
+
+
+# Marks a signed instrument as an amendment/successor.
+_AMENDMENT_KEYWORDS: tuple[str, ...] = (
+    "amendment", "amend", "amended", "addendum", "variation order", "variation",
+    "supplement", "supplementary", "successor", "side letter", "change order",
+    "revised agreement", "novation",
+    "ملحق", "تعديل", "معدل", "اتفاقية معدلة",
+)
+
+# Document/contract reference tokens inside a `documents_signed` string, e.g.
+# "amendment 2 to BLD-2024-019" → {"bld2024019"}.
+_SIGNED_REF_RE = re.compile(r"\b[A-Za-z]{2,6}[-\s/]?\d{2,4}(?:[-\s/]?\d{1,6})+\b")
+
+
+def _signed_ref_tokens(text: str) -> set[str]:
+    return {
+        normalize_identifier(m.group(0))
+        for m in _SIGNED_REF_RE.finditer(text or "")
+        if normalize_identifier(m.group(0))
+    }
+
+
+def _is_amendment_of(candidate: str, base: str) -> bool:
+    """True when `candidate` names itself an amendment of `base` AND shares its reference."""
+    c = (candidate or "").strip().lower()
+    b = (base or "").strip().lower()
+    if not c or not b or c == b:
+        return False
+    if not any(kw in c for kw in _AMENDMENT_KEYWORDS):
+        return False
+    c_refs = _signed_ref_tokens(candidate)
+    b_refs = _signed_ref_tokens(base)
+    if b_refs and (c_refs & b_refs):
+        return True
+    # No ref on the base: fall back to its name being quoted in the amendment.
+    if not b_refs and len(b) >= 6 and b in c:
+        return True
+    return False
+
+
+def find_signatory_mismatches(doc_ids: list[str]) -> list[dict]:
+    """Amendment/successor signed BELOW the original signer's authority, with an
+    explicit shared reference. A normal multi-role approval chain never matches."""
+    if not doc_ids:
+        return []
+    settings = get_settings()
+
+    def _run(driver: Driver):
+        with driver.session(database=settings.neo4j_database) as session:
+            result = session.run(
+                """
+                MATCH (p:Entity)-[:FOUND_IN]->(d:Document)
+                WHERE p.entity_type = 'person'
+                  AND d.doc_id IN $doc_ids
+                  AND p.signing_authority_level IS NOT NULL
+                  AND size(coalesce(p.documents_signed, [])) > 0
+                RETURN p.normalized_value AS name,
+                       p.role_title AS title,
+                       p.signing_authority_level AS authority,
+                       coalesce(p.documents_signed, []) AS signed,
+                       d.doc_id AS doc_id,
+                       d.filename AS doc_name,
+                       coalesce(p.source_page, 0) AS page
+                LIMIT 200
+                """,
+                doc_ids=doc_ids,
+            )
+            return [dict(r) for r in result]
+
+    try:
+        people = _run_with_reconnect(_run)
+    except Exception as e:
+        logger.warning("Signatory mismatch query failed: %s", e)
+        return []
+
+    seen: set[frozenset] = set()
+    out: list[dict] = []
+    for base in people:
+        base_name = str(base.get("name") or "").strip()
+        base_rank = _AUTHORITY_RANK.get(str(base.get("authority") or "unknown").lower(), 0)
+        base_signed = [str(s) for s in (base.get("signed") or []) if s]
+        for amend in people:
+            amend_name = str(amend.get("name") or "").strip()
+            if not base_name or not amend_name or base_name.lower() == amend_name.lower():
+                continue
+            amend_rank = _AUTHORITY_RANK.get(str(amend.get("authority") or "unknown").lower(), 0)
+            # Only when the amendment is signed below the original's level.
+            if amend_rank >= base_rank:
+                continue
+            amend_signed = [str(s) for s in (amend.get("signed") or []) if s]
+            link = next(
+                (
+                    (bs, cs)
+                    for bs in base_signed
+                    for cs in amend_signed
+                    if _is_amendment_of(cs, bs)
+                ),
+                None,
+            )
+            if link is None:
+                continue
+            pair_key = frozenset({base_name.lower(), amend_name.lower()})
+            if pair_key in seen:
+                continue
+            seen.add(pair_key)
+            base_instrument, amend_instrument = link
+            out.append({
+                "name1": base_name,
+                "title1": base.get("title") or base.get("authority"),
+                "authority1": base.get("authority"),
+                "signed1": [base_instrument],
+                "doc1_id": base.get("doc_id"),
+                "doc1_name": base.get("doc_name"),
+                "page1": base.get("page", 0),
+                "name2": amend_name,
+                "title2": amend.get("title") or amend.get("authority"),
+                "authority2": amend.get("authority"),
+                "signed2": [amend_instrument],
+                "doc2_id": amend.get("doc_id"),
+                "doc2_name": amend.get("doc_name"),
+                "page2": amend.get("page", 0),
+                "authority_gap": abs(base_rank - amend_rank),
+            })
+
+    if out:
+        logger.info("Signatory mismatch: %d amendment/authority pair(s) found", len(out))
+    return out

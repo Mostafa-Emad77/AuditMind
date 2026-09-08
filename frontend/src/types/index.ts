@@ -6,6 +6,9 @@ export type DocType =
   | "balance_sheet"
   | "bank_statement"
   | "audit_report"
+  | "payment_certificate"
+  | "qs_report"
+  | "board_resolution"
   | "unknown";
 
 export type Language = "arabic" | "english" | "mixed" | "unknown";
@@ -50,6 +53,10 @@ export interface ReconciliationSnapshot {
   bank_paid_total: number | null;
   variance_vs_contract: number | null;
   notes?: string | null;
+  /** True when extracted bank debits don't reconcile with the statement's stated Total Debits. */
+  bank_extraction_incomplete?: boolean;
+  bank_debits_verified?: number | null;
+  bank_debits_stated?: number | null;
 }
 
 export interface EntityConflictRow {
@@ -140,37 +147,6 @@ export interface SSEEvent {
   finding_count?: number;
   document_count?: number;
   message?: string;
-}
-
-// ─── Graph Types ─────────────────────────────────────────────────────────────
-
-export interface GraphNode {
-  id: string;
-  label: string;
-  node_type: string;
-  doc_id?: string;
-  mention_count?: number;
-  degree?: number;
-  is_center?: boolean;
-  raw_ids?: string[];
-  properties?: Record<string, unknown>;
-}
-
-export interface GraphEdge {
-  source: string;
-  target: string;
-  relationship: string;
-  is_contradiction?: boolean;
-  count?: number;
-  show_label?: boolean | null;
-  properties?: Record<string, unknown>;
-}
-
-export interface GraphData {
-  nodes: GraphNode[];
-  edges: GraphEdge[];
-  center_node?: string | null;
-  view?: string;
 }
 
 // ─── Upload ───────────────────────────────────────────────────────────────────

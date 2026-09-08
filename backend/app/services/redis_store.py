@@ -1,16 +1,5 @@
-"""
-Redis-backed session and report store.
-Replaces the in-memory _sessions / _reports dicts in main.py.
-
-Keys used:
-  session:{audit_id}          → JSON-serialized AuditSession   (TTL: 7 days)
-  report:{audit_id}           → JSON-serialized AuditReport    (TTL: 7 days)
-  chat:{audit_id}              → JSON list of {role, content}   (TTL: 7 days)
-  triage:{audit_id}           → JSON map finding_id → record   (TTL: 7 days)
-  events:{audit_id}           → List of persisted SSE events   (TTL: 7 days)
-  heartbeat:{audit_id}        → "1"                             (TTL: 2 min — liveness signal)
-  suppressed:{scope}:signatures → Set of finding signatures    (no TTL — per-API-key feedback)
-"""
+"""Redis store. Keys: session|report|chat|triage|events:{audit_id} (7-day TTL),
+heartbeat:{audit_id} (2 min), suppressed:{scope}:signatures (no TTL)."""
 import json
 import logging
 from typing import Optional
@@ -215,12 +204,9 @@ async def is_heartbeat_alive(audit_id: str) -> bool:
     return bool(await r.exists(f"heartbeat:{audit_id}"))
 
 
-# ─── Audit event log (background execution decoupled from the SSE connection) ─
-# The pipeline appends every SSE-shaped event (reasoning_step, report_ready, complete,
-# error) to a Redis list as it runs. The `/stream` endpoint is a pure read-only
-# subscriber: it replays this list from the beginning, then tails new entries as they
-# arrive — so a client disconnecting (tab close, network blip) no longer kills the
-# audit, and reconnecting resumes the trace instead of losing it.
+# ─── Audit event log ──────────────────────────────────────────────────────────
+# The pipeline appends SSE events here; /stream replays then tails, so a client
+# disconnect never kills the audit.
 
 async def append_audit_event(audit_id: str, event: dict) -> None:
     """Append one SSE-shaped event to the audit's persisted event log."""

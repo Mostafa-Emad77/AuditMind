@@ -1,6 +1,5 @@
 """LLM-based entity and relationship extraction from document chunks."""
 import asyncio
-import json
 import logging
 from typing import Optional, Callable, Awaitable, get_args
 
@@ -21,6 +20,34 @@ _VALID_AUTHORITY_LEVELS: frozenset[str] = frozenset(
     {"chairman", "ceo", "cfo", "director", "manager", "other", "unknown"}
 )
 
+# Title keywords → authority level, most senior first; backstops the LLM's level.
+_AUTHORITY_FROM_TITLE: tuple[tuple[str, str], ...] = (
+    ("chairman", "chairman"),
+    ("رئيس مجلس", "chairman"),
+    ("chief executive", "ceo"),
+    ("ceo", "ceo"),
+    ("المدير التنفيذي", "ceo"),
+    ("chief financial", "cfo"),
+    ("cfo", "cfo"),
+    ("finance director", "director"),
+    ("managing director", "director"),
+    ("director", "director"),
+    ("مدير عام", "director"),
+    ("manager", "manager"),
+    ("مدير", "manager"),
+)
+
+
+def _authority_from_title(title: Optional[str]) -> Optional[str]:
+    """Infer a signing authority level from a stated job title."""
+    if not title:
+        return None
+    t = title.strip().lower()
+    for keyword, level in _AUTHORITY_FROM_TITLE:
+        if keyword in t:
+            return level
+    return None
+
 _EXTRACTION_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """You are a financial document analysis expert specializing in Arabic and English documents.
 Extract all entities and relationships from the provided text chunk.
@@ -35,6 +62,8 @@ Return a JSON object with exactly this structure:
       "source_language": "arabic|english|mixed|unknown — language of the surface text for THIS entity span",
       "coreference_note": "null or short text: if the same real-world concept appears in Arabic in one place and English elsewhere in this chunk, state the link explicitly (e.g. 'same party as …')",
       "amount_role": "(only for amount entities) one of: total_contract_value|milestone_scheduled|retainer|total_invoice|invoice_subtotal|invoice_line_item|invoice_referenced_contract_value|transaction_debit|transaction_credit|statement_total_debits|statement_total_credits|running_balance|opening_balance|closing_balance|vat_tax|late_fee|unknown",
+      "transaction_ref": "(only for amount entities on a bank-statement transaction row, else null) the row's Reference / TXN number exactly as written, e.g. 'TXN-Q1-010'",
+      "transaction_date": "(only for amount entities on a bank-statement transaction row, else null) that row's date, normalized to YYYY-MM-DD if possible",
       "western_numeral_form": "(only for amount entities, else null) the amount written with Western digits 0-9 if present",
       "arabic_indic_numeral_form": "(only for amount entities, else null) the amount written with Arabic-Indic digits ١٢٣ if present",
       "numeral_mismatch": "(only for amount entities, else null) true if both forms above are present and denote different numeric values; false if both present and agree; null if only one script appears",
@@ -67,7 +96,13 @@ Rules:
   INVOICE-SIDE:
   * total_invoice — the invoice grand total / total due (after VAT)
   * invoice_subtotal — the invoice subtotal BEFORE VAT
-  * invoice_line_item — a single line on an invoice, not any total
+  * invoice_line_item — a single line on an invoice that has no more specific role below.
+    ROLE PRECEDENCE: a role describes what an amount IS, not where it sits. A recurring
+    retainer billed as an invoice line is `retainer`, and a contract milestone billed as
+    an invoice line is `milestone_scheduled` — in both cases use the specific role, NOT
+    invoice_line_item. Getting this wrong hides rate changes: a retainer billed at a
+    different rate than the contract sets can only be caught when both figures carry the
+    `retainer` role.
   * invoice_referenced_contract_value — an invoice RESTATING what it claims the contract's
     total value is (e.g. "against Contract CTR-2024-044, value EGP 180,000"). This is NOT
     total_contract_value. Use this role whenever a NON-contract document asserts the
@@ -91,6 +126,14 @@ Rules:
   the Debit figure as transaction_debit, the Credit figure as transaction_credit,
   and the Balance figure as running_balance. Never emit one merged "amount" for a row,
   and never label a Balance figure as a debit or credit.
+- [TABLE ROW] LINES: a line starting with "[TABLE ROW]" is ONE complete table row with
+  cells separated by " | ", in the column order given on the "[TABLE ROW] columns:" line.
+  Read each such line as a single record: take the ref, date, debit, credit and balance
+  from THAT line only. Never combine cells from two different [TABLE ROW] lines.
+- TRANSACTION IDENTITY: for every bank-statement transaction amount (debit or credit),
+  also fill transaction_ref (the row's Reference / TXN number) and transaction_date (the
+  row's date). Two rows are the SAME transaction only if ref, date AND amount all match;
+  a shared payee/beneficiary name alone NEVER makes two rows the same transaction.
 - RUNNING BALANCE IS NOT A TRANSACTION: running_balance values are cumulative account
   state, not transaction values. They must never be summed, never compared to invoice or
   contract totals, and never used in any "total paid" calculation. Tagging a Balance-column
@@ -143,6 +186,8 @@ async def extract_entities_from_chunk(
                     # Deterministic amount parsing — independent of LLM string formatting.
                     parsed_amount: float | None = None
                     parsed_currency: str | None = None
+                    txn_ref: str | None = None
+                    txn_date: str | None = None
                     if etype == "amount":
                         # Prefer normalized_value (the LLM is instructed to put canonical Western form there).
                         for candidate in (norm_val, raw_val, e.get("western_numeral_form")):
@@ -152,11 +197,17 @@ async def extract_entities_from_chunk(
                                 parsed_currency = extract_currency_code(candidate)
                             if parsed_amount is not None and parsed_currency is not None:
                                 break
+                        txn_ref = (str(e.get("transaction_ref")).strip() or None) \
+                            if e.get("transaction_ref") is not None else None
+                        txn_date = (str(e.get("transaction_date")).strip() or None) \
+                            if e.get("transaction_date") is not None else None
                     kwargs: dict = dict(
                         entity_id=canonical_entity_id(
                             etype, norm_val, chunk.doc_id,
                             amount_value=parsed_amount,
                             amount_currency=parsed_currency,
+                            txn_ref=txn_ref,
+                            txn_date=txn_date,
                         ),
                         entity_type=etype,
                         value=raw_val,
@@ -191,6 +242,8 @@ async def extract_entities_from_chunk(
                         kwargs["amount_role"] = raw_role if raw_role in _VALID_AMOUNT_ROLES else "unknown"
                         kwargs["amount_value"] = parsed_amount
                         kwargs["amount_currency"] = parsed_currency
+                        kwargs["txn_ref"] = txn_ref
+                        kwargs["txn_date"] = txn_date
                     else:
                         kwargs["western_numeral_form"] = None
                         kwargs["arabic_indic_numeral_form"] = None
@@ -199,24 +252,27 @@ async def extract_entities_from_chunk(
                         kwargs["amount_currency"] = None
                     if etype == "person":
                         raw_auth = str(e.get("signing_authority_level") or "").strip().lower()
-                        kwargs["signing_authority_level"] = (
-                            raw_auth if raw_auth in _VALID_AUTHORITY_LEVELS else None
-                        )
-                        kwargs["role_title"] = (str(e.get("role_title")).strip() or None) \
+                        title = (str(e.get("role_title")).strip() or None) \
                             if e.get("role_title") is not None else None
+                        auth = raw_auth if raw_auth in _VALID_AUTHORITY_LEVELS else None
+                        # Stated title beats a non-committal level from the model.
+                        if auth in (None, "other", "unknown"):
+                            auth = _authority_from_title(title) or auth
+                        kwargs["signing_authority_level"] = auth
+                        kwargs["role_title"] = title
                         kwargs["document_signed"] = (str(e.get("document_signed")).strip() or None) \
                             if e.get("document_signed") is not None else None
                     entities.append(Entity(**kwargs))
                 except Exception:
                     continue
 
-            # Dedupe entities within this chunk by canonical entity_id (LLM may emit duplicates).
+            # Dedupe within chunk by canonical id.
             entities = list({ent.entity_id: ent for ent in entities}.values())
 
             relationships = []
             entity_map: dict[str, Entity] = {}
             for ent in entities:
-                # Use lowercased keys so LLM casing/whitespace drift still resolves.
+                # Lowercased keys absorb casing/whitespace drift.
                 entity_map[ent.value.strip().lower()] = ent
                 entity_map[ent.normalized_value.strip().lower()] = ent
 
@@ -270,21 +326,8 @@ async def extract_entities_from_chunks(
         Callable[[int, int, int, int, DocumentChunk], Awaitable[None] | None]
     ] = None,
 ) -> tuple[list[Entity], list[Relationship]]:
-    """
-    Extract entities from multiple chunks concurrently with a semaphore.
-
-    max_chunks resolution order:
-      1. Explicit `max_chunks` argument (back-compat).
-      2. Otherwise: `settings.extraction_chunk_cap` (None = no internal cap).
-         The single upstream gate is `extraction_top_k_max` applied during
-         retrieval — this avoids the prior double-cap bug where well-retrieved
-         chunks were silently truncated to 15 here.
-
-    Concurrency and inter-batch sleep are controlled by config:
-      - extraction_concurrency: max parallel LLM calls (default 3 for paid tier)
-      - extraction_chunk_sleep: seconds between batches (default 0 for paid tier;
-        set to 4.0 in .env to restore free-tier safe pacing)
-    """
+    """Extract from chunks concurrently. Cap: explicit max_chunks, else
+    settings.extraction_chunk_cap (None = none). Concurrency/sleep from settings."""
     settings = get_settings()
     concurrency = max(1, settings.extraction_concurrency)
     chunk_sleep = max(0.0, settings.extraction_chunk_sleep)

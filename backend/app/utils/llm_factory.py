@@ -35,20 +35,9 @@ def get_llm(
     temperature: float = 0.0,
     role: OpenRouterRole | None = None,
 ) -> BaseChatModel:
-    """
-    Return the configured LLM instance.
+    """Configured chat model, cached per (temperature, role).
 
-    Cached on (temperature, role): the underlying clients are stateless and settings
-    are fixed for the process lifetime, so we build each distinct client once instead
-    of re-instantiating it on every call.
-
-    When LLM_PROVIDER=google, uses Google AI Studio (Gemini) via langchain-google-genai.
-    When LLM_PROVIDER=openrouter (default), uses OpenRouter via ChatOpenAI.
-
-    ``role`` selects a dedicated model slug:
-    ``ner_arabic`` → NER / entity extraction model.
-    ``relation``   → cross-checker / contradiction model.
-    When ``role`` is None, uses the general / planning / report model.
+    role: ner_arabic → extraction model; relation → cross-checker model; None → general.
     """
     settings = get_settings()
 
@@ -62,9 +51,11 @@ def get_llm(
     else:
         model = settings.openrouter_model
 
-    extra_body: dict = {}
-    if role is None and settings.openrouter_reasoning:
-        extra_body["reasoning"] = {"enabled": True}
+    # Set reasoning explicitly both ways: some models think by default and burn
+    # thousands of tokens on tiny prompts when the flag is merely omitted.
+    extra_body: dict = {
+        "reasoning": {"enabled": bool(role is None and settings.openrouter_reasoning)}
+    }
 
     return ChatOpenAI(
         model=model,
@@ -73,7 +64,8 @@ def get_llm(
         temperature=temperature,
         timeout=settings.llm_timeout_seconds,
         max_retries=settings.llm_max_retries,
-        extra_body=extra_body if extra_body else None,
+        max_tokens=settings.llm_max_output_tokens,
+        extra_body=extra_body,
         default_headers={
             "HTTP-Referer": "https://github.com/auditmind",
             "X-Title": "AuditMind",

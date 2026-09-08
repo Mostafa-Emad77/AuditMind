@@ -89,15 +89,7 @@ def detect_language(text: str) -> str:
 
 
 def normalize_arabic(text: str) -> str:
-    """
-    Normalize Arabic text for consistent entity matching:
-    1. Remove tashkeel (diacritics)
-    2. Normalize alef variants → bare alef (ا)
-    3. Normalize yaa variants → dotless yaa (ى)
-    4. Normalize taa marbuta → haa (ه)  [optional, controlled by flag]
-    5. Remove kashida (tatweel)
-    6. Collapse whitespace
-    """
+    """Strip tashkeel/kashida, unify alef/yaa (and taa marbuta by flag), collapse whitespace."""
     text = _TASHKEEL.sub("", text)
     text = _ALEF_VARIANTS.sub("ا", text)
     text = _YAA_VARIANTS.sub("ي", text)
