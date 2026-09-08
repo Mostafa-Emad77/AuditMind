@@ -3,6 +3,7 @@ import io
 import logging
 import re
 import uuid
+from collections import Counter
 from typing import Optional
 
 import fitz  # PyMuPDF
@@ -13,6 +14,7 @@ from app.utils.arabic_normalizer import (
     detect_language,
     normalize_mixed_text,
 )
+from app.config import get_settings
 from app.utils.llm_factory import get_llm
 from app.utils.llm_json import extract_json_obj as _extract_json_obj, normalize_llm_content
 from app.services.vector_store import store_chunks
@@ -296,6 +298,10 @@ def _classify_document_type_heuristic(text: str, filename: str) -> str:
 # the LLM mis-pairs refs with amounts. Tables are lifted as one `a | b | c` line per row.
 
 _TABLE_MIN_COLS = 3
+_TABLE_MIN_ROWS = 2
+# Requires a thousands separator or decimals, so the year inside a date
+# ("01/01/2025") is not mistaken for an amount.
+_AMOUNT_CELL_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\.\d{2}")
 _HEADER_HINT_RE = re.compile(
     r"date|ref|txn|description|debit|credit|balance|amount|qty|quantity|rate|item"
     r"|تاريخ|مرجع|بيان|مدين|دائن|رصيد|مبلغ|كمية",
@@ -316,21 +322,49 @@ def _looks_like_header(cells: list[str]) -> bool:
     return has_hint and not has_amount
 
 
+def _looks_tabular(rows: list[list[str]]) -> bool:
+    """Guard for the text strategy, whose clustering can turn prose into a "table"."""
+    if len(rows) < _TABLE_MIN_ROWS:
+        return False
+    if _looks_like_header(rows[0]):
+        return True
+    numeric = sum(1 for r in rows if any(_AMOUNT_CELL_RE.search(c) for c in r if c))
+    return numeric >= max(2, len(rows) // 2)
+
+
+def _page_tables(page: fitz.Page) -> list:
+    """Ruled tables first; fall back to text alignment for borderless layouts.
+
+    A borderless statement yields nothing under the default "lines" strategy, so its
+    register fell through to flattened one-cell-per-line prose and the entity LLM
+    re-paired refs with the neighbouring row's amounts.
+    """
+    for strategy in ("lines", "text"):
+        try:
+            tables = page.find_tables(strategy=strategy).tables
+        except Exception as e:  # best-effort; never fail ingestion on it
+            logger.debug("find_tables(%s) failed: %s", strategy, e)
+            continue
+        usable = [t for t in tables if (t.col_count or 0) >= _TABLE_MIN_COLS]
+        if strategy == "text":
+            usable = [
+                t for t in usable
+                if _looks_tabular([[_clean_cell(c) for c in r] for r in t.extract()])
+            ]
+        if usable:
+            if strategy == "text":
+                logger.info("Tables recovered via text-alignment strategy (borderless page)")
+            return usable
+    return []
+
+
 def _extract_page_tables(page: fitz.Page) -> tuple[list[fitz.Rect], list[tuple[str, list[str]]]]:
     """(table_rects, [(header, rows)]) per page. Header carries forward across
     fragments; fragments narrower than _TABLE_MIN_COLS (footers) are ignored."""
-    try:
-        found = page.find_tables()
-    except Exception as e:  # find_tables is best-effort; never fail ingestion on it
-        logger.debug("find_tables failed on page: %s", e)
-        return [], []
-
     rects: list[fitz.Rect] = []
     blocks: list[tuple[str, list[str]]] = []
     carried_header: str | None = None
-    for table in found.tables:
-        if (table.col_count or 0) < _TABLE_MIN_COLS:
-            continue
+    for table in _page_tables(page):
         rows = [[_clean_cell(c) for c in r] for r in table.extract()]
         rows = [r for r in rows if any(r)]
         if not rows:
@@ -345,6 +379,151 @@ def _extract_page_tables(page: fitz.Page) -> tuple[list[fitz.Rect], list[tuple[s
             continue  # header-only fragment: still masks its region, defines header
         blocks.append((header or "", [" | ".join(r) for r in rows]))
     return rects, blocks
+
+
+# A flattened register: PyMuPDF puts every cell on its own line, so a row's ref and
+# its amounts are separated and the entity LLM pairs an amount with the NEXT row's
+# ref. Rows stay recoverable because each one begins with its date — no column
+# geometry needed, which is what find_tables could not supply for a borderless page.
+_MONTHS_EN = "jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec"
+_MONTHS_AR = (
+    "يناير|فبراير|مارس|أبريل|ابريل|مايو|يونيو|يوليو|أغسطس|اغسطس|سبتمبر|أكتوبر|اكتوبر|نوفمبر|ديسمبر"
+)
+_D = r"[\d٠-٩]"  # Western or Arabic-Indic digit — reassembly runs before normalization
+# A row starts at its date. Dotted form requires a full year so a numbered contract
+# clause ("1.5.2") is never read as one.
+_ROW_DATE_RE = re.compile(
+    r"^\s*(?:"
+    rf"{_D}{{1,4}}[/-]{_D}{{1,2}}[/-]{_D}{{2,4}}"
+    rf"|{_D}{{1,2}}\.{_D}{{1,2}}\.{_D}{{4}}"
+    rf"|{_D}{{1,2}}\s+(?:{_MONTHS_EN}|{_MONTHS_AR})[a-z\u0600-\u06FF]*\.?,?\s+{_D}{{2,4}}"
+    rf"|(?:{_MONTHS_EN})[a-z]*\.?\s+{_D}{{1,2}},?\s+{_D}{{2,4}}"
+    r")",
+    re.IGNORECASE,
+)
+_REGISTER_HINT_RE = re.compile(r"debit|credit|balance|مدين|دائن|رصيد", re.IGNORECASE)
+_MIN_REGISTER_ROWS = 3
+_STRAY_SEGMENT_CHARS = 40
+
+
+def _join_cells(cells: list[str]) -> str:
+    """Join a row's cells, healing identifiers split across lines ("TXN-" + "003")."""
+    out: list[str] = []
+    for cell in cells:
+        if out and out[-1].endswith("-") and cell[:1].isalnum():
+            out[-1] += cell
+        else:
+            out.append(cell)
+    return " | ".join(out)
+
+
+def _reassemble_flattened_rows(text: str) -> tuple[str, list[str]] | None:
+    """Rebuild transaction rows from a page whose table was flattened.
+
+    Returns (text before the register, one line per row), or None when the page
+    does not look like a register.
+    """
+    if not _REGISTER_HINT_RE.search(text):
+        return None
+    lines = text.splitlines()
+    starts = [i for i, ln in enumerate(lines) if _ROW_DATE_RE.match(ln)]
+    if len(starts) < _MIN_REGISTER_ROWS:
+        return None
+    rows: list[str] = []
+    pending = ""
+    for begin, end in zip(starts, starts[1:] + [len(lines)]):
+        cells = [ln.strip() for ln in lines[begin:end] if ln.strip()]
+        if not cells:
+            continue
+        row = _join_cells(cells)
+        # Registers that carry both a posting and a value date open two segments per
+        # row; the one with no amount is the stray half of the row that follows.
+        if not _AMOUNT_CELL_RE.search(row) and len(row) <= _STRAY_SEGMENT_CHARS:
+            pending = f"{pending} | {row}" if pending else row
+            continue
+        rows.append(f"{pending} | {row}" if pending else row)
+        pending = ""
+    if pending:
+        rows.append(pending)
+    if sum(1 for r in rows if _AMOUNT_CELL_RE.search(r)) < _MIN_REGISTER_ROWS:
+        return None
+    return "\n".join(lines[:starts[0]]), rows
+
+
+# Last-resort repair for a flattened table the deterministic layers cannot split —
+# a balance sheet or invoice line-item table, which has no date to key rows on.
+_NUMBER_RE = re.compile(r"\d[\d,.]*")
+_FLAT_TABLE_MIN_LINES = 12
+_FLAT_TABLE_MIN_NUMERIC = 6
+_SHORT_LINE_CHARS = 45
+
+_TABLE_REPAIR_PROMPT = (
+    "The text below comes from one page of a financial document whose table was "
+    "flattened to one cell per line, so its rows are broken apart.\n"
+    "Rebuild the original rows.\n\n"
+    "Rules:\n"
+    "- Output ONE line per original row, cells separated by ' | '.\n"
+    "- EVERY input line must belong to exactly one output line. A line that is not part "
+    "of the table (a heading, an address) becomes its own output line, unchanged.\n"
+    "- Use ONLY text from the input. Never add, drop, merge, split, correct or "
+    "recalculate a number, and never invent one.\n"
+    "- Keep the input's order.\n"
+    "- Output the rows and nothing else — no commentary, no code fences.\n\n"
+    "TEXT:\n"
+)
+
+
+def _looks_flattened_table(text: str) -> bool:
+    """Many short lines with a high numeric density — the shape of a flattened table."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) < _FLAT_TABLE_MIN_LINES:
+        return False
+    numeric = sum(1 for ln in lines if _AMOUNT_CELL_RE.search(ln))
+    short = sum(1 for ln in lines if len(ln) <= _SHORT_LINE_CHARS)
+    return numeric >= _FLAT_TABLE_MIN_NUMERIC and short >= len(lines) * 0.6
+
+
+def _number_multiset(text: str) -> Counter:
+    """Every numeric value in the text, by value so formatting may vary."""
+    out: Counter = Counter()
+    for token in _NUMBER_RE.findall(text):
+        try:
+            out[round(float(token.replace(",", "").rstrip(".")), 2)] += 1
+        except ValueError:
+            continue
+    return out
+
+
+def _llm_repair_flattened_table(text: str) -> tuple[str, list[str]] | None:
+    """Have a model re-partition a flattened table into rows, then verify it did.
+
+    Rebuilding rows is a pure re-partition, so the output must contain exactly the
+    numbers the input contained. A model that drops, duplicates or invents a figure
+    fails that check and its output is discarded — free-form LLM row pairing is what
+    produced the wrong bank total in the first place, and this is what makes asking
+    a model safe. Returns (prose, rows) or None.
+    """
+    if not get_settings().extraction_llm_table_repair:
+        return None
+    try:
+        response = get_llm(temperature=0.0).invoke(_TABLE_REPAIR_PROMPT + text)
+        content = normalize_llm_content(response)
+    except Exception as e:
+        logger.debug("LLM table repair call failed: %s", e)
+        return None
+
+    lines = [ln.strip() for ln in (content or "").splitlines() if ln.strip("` \t")]
+    if not lines:
+        return None
+    if _number_multiset("\n".join(lines)) != _number_multiset(text):
+        logger.warning("LLM table repair rejected: numbers were not conserved")
+        return None
+
+    rows = [ln for ln in lines if _AMOUNT_CELL_RE.search(ln)]
+    if len(rows) < _MIN_REGISTER_ROWS:
+        return None
+    prose = "\n".join(ln for ln in lines if not _AMOUNT_CELL_RE.search(ln))
+    return prose, rows
 
 
 def _text_outside_rects(page: fitz.Page, rects: list[fitz.Rect]) -> str:
@@ -414,6 +593,28 @@ def process_pdf(
             if table_blocks:
                 text = _text_outside_rects(page, table_rects)
                 tables_by_page[page_num + 1] = table_blocks
+
+        # Last resort, for a digital page with no detectable table and for OCR output
+        # alike: a register flattened one cell per line is still recoverable from the
+        # date that begins each row.
+        if page_num + 1 not in tables_by_page:
+            flattened = _reassemble_flattened_rows(text)
+            if flattened:
+                text, register_rows = flattened
+                tables_by_page[page_num + 1] = [("", register_rows)]
+                logger.info(
+                    "Rebuilt %d flattened register row(s) on page %d",
+                    len(register_rows), page_num + 1,
+                )
+            elif _looks_flattened_table(text):
+                repaired = _llm_repair_flattened_table(text)
+                if repaired:
+                    text, repaired_rows = repaired
+                    tables_by_page[page_num + 1] = [("", repaired_rows)]
+                    logger.info(
+                        "LLM repaired %d table row(s) on page %d",
+                        len(repaired_rows), page_num + 1,
+                    )
 
         if text.strip() or tables_by_page.get(page_num + 1):
             all_text_by_page.append((page_num + 1, text, used_ocr))

@@ -52,10 +52,15 @@ def get_llm(
         model = settings.openrouter_model
 
     # Set reasoning explicitly both ways: some models think by default and burn
-    # thousands of tokens on tiny prompts when the flag is merely omitted.
-    extra_body: dict = {
-        "reasoning": {"enabled": bool(role is None and settings.openrouter_reasoning)}
-    }
+    # thousands of tokens on tiny prompts when the flag is merely omitted, while
+    # others (minimax-m2.5) reject a request that tries to disable it outright.
+    if role == "relation":
+        reasoning_on = settings.openrouter_reasoning_relation
+    elif role is None:
+        reasoning_on = settings.openrouter_reasoning
+    else:
+        reasoning_on = False  # NER is mechanical extraction; thinking is wasted there
+    extra_body: dict = {"reasoning": {"enabled": reasoning_on}}
 
     return ChatOpenAI(
         model=model,

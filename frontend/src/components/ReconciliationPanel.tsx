@@ -192,6 +192,23 @@ export function ReconciliationPanel({
         </div>
       )}
 
+      {(snap?.integrity_warnings?.length ?? 0) > 0 && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 flex items-start gap-2">
+          <span className="material-symbols-outlined text-[18px] text-amber-600 mt-0.5">calculate</span>
+          <div className="text-[13px] text-amber-800">
+            <p className="font-semibold">Document arithmetic did not reconcile.</p>
+            <ul className="mt-1 list-disc pl-4 space-y-0.5">
+              {snap!.integrity_warnings!.map((w, i) => (
+                <li key={i}>{w}</li>
+              ))}
+            </ul>
+            <p className="mt-1 text-amber-700">
+              Figures stated by the document itself disagree with what was extracted — some may be missing.
+            </p>
+          </div>
+        </div>
+      )}
+
       {snap?.notes && (
         <p className="text-xs text-muted-foreground px-1">{snap.notes}</p>
       )}

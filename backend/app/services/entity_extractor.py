@@ -48,6 +48,29 @@ def _authority_from_title(title: Optional[str]) -> Optional[str]:
             return level
     return None
 
+# A document type can only carry roles that make sense for it. A bank statement holds
+# transactions and balances, never a contract's payment schedule: its recap line
+# "TXN-005: EGP 68,400 (milestone 1)" is a payment, and tagging it milestone_scheduled
+# put bank amounts into pairwise comparison with every contract milestone.
+_ROLES_BY_DOC_TYPE: dict[str, frozenset[str]] = {
+    "bank_statement": frozenset({
+        "transaction_debit", "transaction_credit",
+        "statement_total_debits", "statement_total_credits",
+        "running_balance", "opening_balance", "closing_balance",
+        "vat_tax", "late_fee", "unknown",
+    }),
+}
+
+
+def _role_for_doc_type(role: str, doc_type: str) -> str:
+    """Demote a role the document type cannot legitimately carry to `unknown`."""
+    allowed = _ROLES_BY_DOC_TYPE.get((doc_type or "").strip().lower())
+    if allowed is not None and role not in allowed:
+        logger.debug("Demoting amount_role %r on a %s to unknown", role, doc_type)
+        return "unknown"
+    return role
+
+
 _EXTRACTION_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """You are a financial document analysis expert specializing in Arabic and English documents.
 Extract all entities and relationships from the provided text chunk.
@@ -61,7 +84,7 @@ Return a JSON object with exactly this structure:
       "normalized_value": "cleaned/normalized version",
       "source_language": "arabic|english|mixed|unknown — language of the surface text for THIS entity span",
       "coreference_note": "null or short text: if the same real-world concept appears in Arabic in one place and English elsewhere in this chunk, state the link explicitly (e.g. 'same party as …')",
-      "amount_role": "(only for amount entities) one of: total_contract_value|milestone_scheduled|retainer|total_invoice|invoice_subtotal|invoice_line_item|invoice_referenced_contract_value|transaction_debit|transaction_credit|statement_total_debits|statement_total_credits|running_balance|opening_balance|closing_balance|vat_tax|late_fee|unknown",
+      "amount_role": "(only for amount entities) one of: total_contract_value|milestone_scheduled|retainer|total_invoice|invoice_subtotal|invoice_line_item|invoice_referenced_contract_value|transaction_debit|transaction_credit|statement_total_debits|statement_total_credits|running_balance|opening_balance|closing_balance|total_assets|total_liabilities|total_equity|vat_tax|late_fee|unknown",
       "transaction_ref": "(only for amount entities on a bank-statement transaction row, else null) the row's Reference / TXN number exactly as written, e.g. 'TXN-Q1-010'",
       "transaction_date": "(only for amount entities on a bank-statement transaction row, else null) that row's date, normalized to YYYY-MM-DD if possible",
       "western_numeral_form": "(only for amount entities, else null) the amount written with Western digits 0-9 if present",
@@ -116,6 +139,10 @@ Rules:
   * statement_total_credits — the statement's own stated "Total Credits" summary figure
   * opening_balance — the statement's opening / beginning balance
   * closing_balance — the statement's closing / ending balance
+  BALANCE-SHEET-SIDE:
+  * total_assets — the stated TOTAL assets figure (not an individual asset line)
+  * total_liabilities — the stated TOTAL liabilities figure
+  * total_equity — the stated total equity / shareholders' funds figure
   OTHER:
   * vat_tax — a VAT or tax amount
   * late_fee — a late-payment penalty or interest charge
@@ -127,9 +154,16 @@ Rules:
   and the Balance figure as running_balance. Never emit one merged "amount" for a row,
   and never label a Balance figure as a debit or credit.
 - [TABLE ROW] LINES: a line starting with "[TABLE ROW]" is ONE complete table row with
-  cells separated by " | ", in the column order given on the "[TABLE ROW] columns:" line.
-  Read each such line as a single record: take the ref, date, debit, credit and balance
-  from THAT line only. Never combine cells from two different [TABLE ROW] lines.
+  cells separated by " | ". When a "[TABLE ROW] columns:" line is present it gives the
+  column order; when it is absent the cells are in reading order, so identify each value
+  by what it is, not by its position. Read each such line as a single record: take the
+  ref, date, debit, credit and balance from THAT line only. Never combine cells from two
+  different [TABLE ROW] lines, and never pair an amount with a ref from another line.
+- READING A BANK REGISTER ROW: the LAST amount on the row is that row's running Balance.
+  The other amount is the transaction itself. Decide debit vs credit from the running
+  balance movement (balance lower than the previous row = money out = transaction_debit;
+  higher = transaction_credit) and from the description (e.g. "Sales Revenue" is a credit,
+  "Payment to"/"Salaries"/"Tax Payment"/"Rent" are debits).
 - TRANSACTION IDENTITY: for every bank-statement transaction amount (debit or credit),
   also fill transaction_ref (the row's Reference / TXN number) and transaction_date (the
   row's date). Two rows are the SAME transaction only if ref, date AND amount all match;
@@ -239,7 +273,9 @@ async def extract_entities_from_chunk(
                         kwargs["coreference_note"] = None
                     if etype == "amount":
                         raw_role = (e.get("amount_role") or "unknown").strip().lower()
-                        kwargs["amount_role"] = raw_role if raw_role in _VALID_AMOUNT_ROLES else "unknown"
+                        if raw_role not in _VALID_AMOUNT_ROLES:
+                            raw_role = "unknown"
+                        kwargs["amount_role"] = _role_for_doc_type(raw_role, doc_type)
                         kwargs["amount_value"] = parsed_amount
                         kwargs["amount_currency"] = parsed_currency
                         kwargs["txn_ref"] = txn_ref

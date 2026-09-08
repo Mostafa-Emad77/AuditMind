@@ -1,6 +1,11 @@
 """Reconciliation payload: structured values are authoritative; gap-fill is
 label-grounded (no positional guessing) and never fabricates from unlabeled prose."""
-from app.models.schemas import Finding, ReconciliationSnapshot
+from app.models.schemas import (
+    DocumentMeta,
+    EntityConflictRow,
+    Finding,
+    ReconciliationSnapshot,
+)
 from app.services.reconciliation_payload import (
     _fill_snapshot_gaps,
     _findings_to_conflict_rows,
@@ -77,40 +82,118 @@ def test_fill_gaps_never_reintroduces_withheld_bank_total():
 
 # ── Reconciliation conflict rows stay consistent with the Findings tab (BUG 3) ──
 
-def _amount_finding(sev: str, title: str, desc: str) -> Finding:
+CONTRACT = DocumentMeta(doc_id="docA", filename="contract.pdf", doc_type="contract")
+BANK = DocumentMeta(doc_id="docB", filename="bank.pdf", doc_type="bank_statement")
+DOCS = [CONTRACT, BANK]
+
+
+def _amount_row(doc_id: str, value: str) -> dict:
+    return {"doc_id": doc_id, "normalized_value": value, "value": value}
+
+
+def _amount_finding(sev: str, title: str, desc: str, evidence=None) -> Finding:
     return Finding(
         severity=sev, title=title, description=desc, confidence_score=0.9,
-        source_doc_id="docA", conflicting_doc_id="docB",
+        source_doc_id="docA", conflicting_doc_id="docB", evidence=evidence or [],
     )
 
 
-def test_amount_findings_become_conflict_rows():
-    findings = [
-        _amount_finding(
-            "critical", "M-3 payment exceeds certified amount",
-            "Bank paid EGP 37,006,052 against certified EGP 36,465,379.",
-        ),
-        _amount_finding(
-            "warning", "Bilingual due date conflict",
-            "The Arabic text says 30 days; the English says 45 days.",  # no 2 amounts
-        ),
-    ]
-    rows = _findings_to_conflict_rows(findings)
+def test_conflict_row_values_sit_under_the_document_they_came_from():
+    """
+    The regression: amounts were sorted by size and assigned positionally, so the
+    bank's 226,700 was rendered in the contract's column and the contract's 200,000
+    in the bank's. Each value must follow its own document.
+    """
+    f = _amount_finding(
+        "critical", "Bank payments exceed contract total",
+        "Contract specifies a total contract value of EGP 200,000.00. The bank statement "
+        "records four payments totaling EGP 226,700.00, which exceeds the contract total "
+        "by EGP 26,700.00.",
+    )
+    rows = _findings_to_conflict_rows(
+        [f], DOCS,
+        [_amount_row("docA", "200000 EGP"), _amount_row("docB", "226700 EGP")],
+    )
     assert len(rows) == 1
-    assert rows[0].severity == "critical"
-    assert rows[0].doc_a_id == "docA" and rows[0].doc_b_id == "docB"
+    r = rows[0]
+    assert (r.doc_a_id, r.doc_a_value) == ("docA", "200,000.00")
+    assert (r.doc_b_id, r.doc_b_value) == ("docB", "226,700.00")
+    assert r.conflict_type == "contract vs bank statement (from finding)"
+
+
+def test_computed_differences_are_not_treated_as_document_values():
+    """26,700 exists in no document — it is the subtraction, not a stated figure."""
+    f = _amount_finding(
+        "critical", "Overpayment",
+        "Contract value EGP 200,000.00 vs bank paid EGP 226,700.00, a gap of EGP 26,700.00.",
+    )
+    rows = _findings_to_conflict_rows(
+        [f], DOCS,
+        [_amount_row("docA", "200000 EGP"), _amount_row("docB", "226700 EGP")],
+    )
+    assert [rows[0].doc_a_value, rows[0].doc_b_value] == ["200,000.00", "226,700.00"]
+
+
+def test_evidence_grounding_beats_an_ambiguous_graph_match():
+    """An amount quoted in an evidence line belongs to that line's document."""
+    f = _amount_finding(
+        "warning", "Final payment mismatch",
+        "Contract lists Final Payment of 35,000.00 EGP. Bank shows 45,370.00 EGP.",
+        evidence=[
+            "contract.pdf, page 1: Final Payment | 31 Mar 2025 | 35,000.00",
+            "bank.pdf, page 1: Final settlement 45,370.00",
+        ],
+    )
+    # Both amounts appear in both documents in the graph — evidence must decide.
+    rows = _findings_to_conflict_rows(
+        [f], DOCS,
+        [_amount_row("docA", "35000 EGP"), _amount_row("docB", "35000 EGP"),
+         _amount_row("docA", "45370 EGP"), _amount_row("docB", "45370 EGP")],
+    )
+    assert (rows[0].doc_a_id, rows[0].doc_a_value) == ("docA", "35,000.00")
+    assert (rows[0].doc_b_id, rows[0].doc_b_value) == ("docB", "45,370.00")
+
+
+def test_unattributable_finding_is_skipped():
+    """No row at all beats a row against the wrong document."""
+    f = _amount_finding(
+        "critical", "Something is off", "Figures of EGP 11,111 and EGP 22,222 disagree.",
+    )
+    assert _findings_to_conflict_rows([f], DOCS, []) == []
+
+
+def test_single_document_finding_produces_no_row():
+    f = _amount_finding(
+        "warning", "Internal inconsistency",
+        "Contract states EGP 200,000.00 in one clause and EGP 150,000.00 in another.",
+    )
+    rows = _findings_to_conflict_rows(
+        [f], DOCS,
+        [_amount_row("docA", "200000 EGP"), _amount_row("docA", "150000 EGP")],
+    )
+    assert rows == []
+
+
+def test_ok_severity_findings_are_ignored():
+    f = Finding(severity="ok", title="Aligned", description="EGP 200,000.00 vs EGP 226,700.00",
+                confidence_score=0.9, source_doc_id="docA", conflicting_doc_id="docB")
+    assert _findings_to_conflict_rows(
+        [f], DOCS,
+        [_amount_row("docA", "200000 EGP"), _amount_row("docB", "226700 EGP")],
+    ) == []
 
 
 def test_merge_keeps_findings_rows_and_dedupes_graph_rows():
-    finding_rows = _findings_to_conflict_rows([
-        _amount_finding(
-            "critical", "Overpayment", "Bank paid EGP 37,006,052 vs certified EGP 36,465,379.",
-        )
-    ])
-    from app.models.schemas import EntityConflictRow
+    finding_rows = _findings_to_conflict_rows(
+        [_amount_finding("critical", "Overpayment",
+                         "Contract value EGP 200,000.00 vs bank paid EGP 226,700.00.")],
+        DOCS,
+        [_amount_row("docA", "200000 EGP"), _amount_row("docB", "226700 EGP")],
+    )
+    assert len(finding_rows) == 1
     graph_dup = EntityConflictRow(
-        entity_label="x", doc_a_id="d1", doc_a_value="37,006,052.00",
-        doc_b_id="d2", doc_b_value="36,465,379.00", severity="critical",
+        entity_label="x", doc_a_id="d1", doc_a_value="200,000.00",
+        doc_b_id="d2", doc_b_value="226,700.00", severity="critical",
     )
     graph_new = EntityConflictRow(
         entity_label="y", doc_a_id="d1", doc_a_value="1,000",
@@ -119,4 +202,4 @@ def test_merge_keeps_findings_rows_and_dedupes_graph_rows():
     merged = _merge_conflict_rows(finding_rows, [graph_dup, graph_new])
     # 1 finding row + the non-duplicate graph row only
     assert len(merged) == 2
-    assert merged[0].conflict_type == "amount finding"
+    assert merged[0].conflict_type.endswith("(from finding)")

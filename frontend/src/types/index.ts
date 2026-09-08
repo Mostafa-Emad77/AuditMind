@@ -57,6 +57,8 @@ export interface ReconciliationSnapshot {
   bank_extraction_incomplete?: boolean;
   bank_debits_verified?: number | null;
   bank_debits_stated?: number | null;
+  /** Arithmetic a document asserts about itself that did not hold once extracted. */
+  integrity_warnings?: string[];
 }
 
 export interface EntityConflictRow {

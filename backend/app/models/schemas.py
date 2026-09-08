@@ -51,6 +51,10 @@ AMOUNT_ROLES = Literal[
     "running_balance",
     "opening_balance",
     "closing_balance",
+    # ── Balance-sheet-side ───────────────────────────────────────────────────
+    "total_assets",
+    "total_liabilities",
+    "total_equity",
     # ── Other ────────────────────────────────────────────────────────────────
     "vat_tax",
     "late_fee",
@@ -175,6 +179,9 @@ class ReconciliationSnapshot(BaseModel):
     bank_extraction_incomplete: bool = False
     bank_debits_verified: Optional[float] = None
     bank_debits_stated: Optional[float] = None
+    # Arithmetic a document asserts about itself that did not hold once extracted —
+    # the signal that figures were missed, outside the bank-statement path.
+    integrity_warnings: list[str] = Field(default_factory=list)
 
 
 class EntityConflictRow(BaseModel):

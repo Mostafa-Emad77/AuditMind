@@ -312,11 +312,10 @@ _INCOMPATIBLE_ROLES: frozenset[str] = frozenset({
 })
 
 
-# Rate-like roles compare without a shared anchor; totals stay anchor-required.
-_ANCHORLESS_SAME_ROLE_PAIRS: frozenset[str] = frozenset({
-    "retainer",
-    "milestone_scheduled",
-})
+# A recurring rate is comparable without a shared anchor: a retainer billed at a
+# different rate than the contract sets is a finding on its own. Milestones are NOT —
+# every contract milestone would pair with every bank payment, N x M rows of noise.
+_ANCHORLESS_SAME_ROLE_PAIRS: frozenset[str] = frozenset({"retainer"})
 
 
 def _role_pair_key(role1: str, role2: str) -> str:
@@ -544,6 +543,40 @@ def find_reference_mismatches(doc_ids: list[str]) -> list[dict]:
     if out:
         logger.info("Reference validation: %d restated value(s) disagree with source", len(out))
     return out
+
+
+def audit_identifier_values(doc_ids: list[str]) -> set[str]:
+    """Alphanumeric cores of the contract/invoice numbers this audit is about.
+
+    A bank row naming one of them ("سداد نهائي عقد CTR-2024-044") is a payment under
+    this audit's contract, whether or not extraction happened to emit a RELATES edge
+    for it — which it did for only one of four such payments.
+    """
+    if not doc_ids:
+        return set()
+    settings = get_settings()
+
+    def _run(driver: Driver):
+        with driver.session(database=settings.neo4j_database) as session:
+            result = session.run(
+                """
+                MATCH (e:Entity)-[:FOUND_IN]->(d:Document)
+                WHERE d.doc_id IN $doc_ids
+                  AND e.entity_type IN ['contract_id', 'invoice_id']
+                RETURN collect(DISTINCT e.normalized_value) AS values
+                """,
+                doc_ids=doc_ids,
+            )
+            rec = result.single()
+            return list(rec["values"]) if rec and rec["values"] else []
+
+    try:
+        values = _run_with_reconnect(_run)
+    except Exception as e:
+        logger.warning("Audit identifier fetch failed: %s", e)
+        return set()
+    # Short cores would match by accident inside unrelated numbers.
+    return {core for core in (normalize_identifier(v or "") for v in values) if len(core) >= 6}
 
 
 def query_graph_for_entities(query_entities: list[str], doc_ids: list[str], depth: int = 2) -> list[dict]:

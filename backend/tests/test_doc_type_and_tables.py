@@ -9,33 +9,28 @@ from app.services.reconciliation_payload import _pick_invoice_total
 
 
 class TestTitleClassifier:
-    def test_payment_certificate_by_filename(self):
-        assert _classify_by_title("", "doc4_payment_cert_PC-2025-007.pdf") == "payment_certificate"
+    # (title block, filename, expected) — the six types that collided in the run where
+    # a certificate, a board resolution and a QS report were typed invoice/invoice/contract.
+    CASES = [
+        ("", "doc4_payment_cert_PC-2025-007.pdf", "payment_certificate"),
+        ("شهادة استحقاق الدفع\nPC-2025-007\nCONTRACT NO. BLD-2024-019\nAmount (EGP) VAT Total",
+         "scan_0001.pdf", "payment_certificate"),
+        ("Board of Directors Meeting Minutes & Resolution\nBR-2025-003\nVAT total amount",
+         "x.pdf", "board_resolution"),
+        ("", "doc6_board_resolution_BR-2025-003.pdf", "board_resolution"),
+        ("Al-Daqqa Quantity Surveying & Engineering\nQS-RPT-025\nMilestone 3 Certification Report",
+         "x.pdf", "qs_report"),
+        # An invoice cites the contract it bills against — it must not become a contract.
+        ("Pyramid Steel\nINV-BLD-2025-031\nagainst Contract BLD-2024-019\nsubtotal VAT total due",
+         "doc3_invoice_INV-BLD-2025-031.pdf", "invoice"),
+        ("Subcontract Agreement — Structural Works\nContract No. BLD-2024-019\nbetween A and B",
+         "doc1_contract_BLD2024019.pdf", "contract"),
+        ("lorem ipsum dolor", "scan.pdf", None),
+    ]
 
-    def test_payment_certificate_by_arabic_title_block(self):
-        head = "شهادة استحقاق الدفع\nPC-2025-007\nCONTRACT NO. BLD-2024-019\nAmount (EGP) VAT Total"
-        assert _classify_by_title(head, "scan_0001.pdf") == "payment_certificate"
-
-    def test_board_resolution(self):
-        head = "Board of Directors Meeting Minutes & Resolution\nBR-2025-003\nVAT total amount"
-        assert _classify_by_title(head, "x.pdf") == "board_resolution"
-        assert _classify_by_title("", "doc6_board_resolution_BR-2025-003.pdf") == "board_resolution"
-
-    def test_qs_report(self):
-        head = "Al-Daqqa Quantity Surveying & Engineering\nQS-RPT-025\nMilestone 3 Certification Report"
-        assert _classify_by_title(head, "x.pdf") == "qs_report"
-
-    def test_invoice_citing_contract_is_still_an_invoice(self):
-        """Invoices routinely cite the contract they bill against — must not become 'contract'."""
-        head = "Pyramid Steel\nINV-BLD-2025-031\nagainst Contract BLD-2024-019\nsubtotal VAT total due"
-        assert _classify_by_title(head, "doc3_invoice_INV-BLD-2025-031.pdf") == "invoice"
-
-    def test_contract(self):
-        head = "Subcontract Agreement — Structural Works\nContract No. BLD-2024-019\nbetween A and B"
-        assert _classify_by_title(head, "doc1_contract_BLD2024019.pdf") == "contract"
-
-    def test_no_title_signal_returns_none(self):
-        assert _classify_by_title("lorem ipsum dolor", "scan.pdf") is None
+    def test_title_block_and_filename_decide_the_type(self):
+        for head, filename, expected in self.CASES:
+            assert _classify_by_title(head, filename) == expected, filename
 
     def test_title_beats_vocabulary_scoring(self):
         """Invoice vocabulary must not override a certificate's title."""

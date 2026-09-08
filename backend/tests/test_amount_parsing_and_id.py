@@ -1,5 +1,9 @@
 """Amount parsing → canonical id collapse + currency extraction + chunk point IDs."""
-from app.utils.canonical_id import canonical_entity_id, canonical_chunk_point_id
+from app.utils.canonical_id import (
+    canonical_chunk_point_id,
+    canonical_entity_id,
+    canonical_rel_id,
+)
 from app.utils.money_parse import (
     parse_monetary_amount,
     extract_currency_code,
@@ -72,3 +76,19 @@ def test_parse_monetary_amount_roundtrip():
     assert parse_monetary_amount("50,000 EGP") == 50000.0
     assert parse_monetary_amount("EGP 50000.00") == 50000.0
     assert parse_monetary_amount("١٠٠ جنيه") == 100.0
+
+
+def test_rel_id_deterministic_and_directional():
+    r1 = canonical_rel_id("e1", "e2", "total_value_of")
+    r2 = canonical_rel_id("e1", "e2", "total_value_of")
+    assert r1 == r2
+    # Direction matters
+    assert r1 != canonical_rel_id("e2", "e1", "total_value_of")
+    # Type matters
+    assert r1 != canonical_rel_id("e1", "e2", "payment_for")
+
+
+def test_rel_type_case_insensitive():
+    a = canonical_rel_id("x", "y", "Payment_For")
+    b = canonical_rel_id("x", "y", "payment_for")
+    assert a == b

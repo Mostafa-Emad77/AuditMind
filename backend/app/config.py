@@ -23,12 +23,20 @@ class Settings(BaseSettings):
         description="NER / entity extraction only; never substituted by OPENROUTER_MODEL",
     )
     openrouter_model_relation: str = Field(
-        default="anthropic/claude-sonnet-4.6",
+        default="minimax/minimax-m2.5",
         description="Cross-checker / contradiction logic only; never substituted by OPENROUTER_MODEL",
     )
     openrouter_reasoning: bool = Field(
         default=True,
-        description="Pass reasoning:{enabled:true} — supported by minimax-m2.5 and other reasoning models",
+        description="Reasoning for the general/planning model. Sent explicitly either way",
+    )
+    openrouter_reasoning_relation: bool = Field(
+        default=True,
+        description=(
+            "Reasoning for the cross-checker model. On by default: adjudication is the "
+            "precision-critical stage, and some models (minimax-m2.5) reject a request "
+            "that tries to disable it."
+        ),
     )
 
     # LLM — Google AI Studio (Gemini)
@@ -143,6 +151,13 @@ class Settings(BaseSettings):
     llm_max_output_tokens: int = Field(
         default=2048,
         description="Cap on completion tokens per call (all prompts ask for compact JSON)",
+    )
+    extraction_llm_table_repair: bool = Field(
+        default=True,
+        description=(
+            "Let an LLM rebuild rows of a flattened table that no deterministic layer "
+            "could recover. Output is accepted only if it conserves every number."
+        ),
     )
     retriever_llm_query_entities: bool = Field(
         default=False,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from typing import Literal, Optional
 
 from app.config import get_settings
@@ -13,7 +14,13 @@ from app.models.schemas import (
     Finding,
     ReconciliationSnapshot,
 )
-from app.services.graph_builder import find_contradictions, get_driver
+from app.services.graph_builder import (
+    audit_identifier_values,
+    find_contradictions,
+    get_driver,
+)
+from app.services.vector_store import get_all_chunks_for_docs
+from app.utils.canonical_id import normalize_identifier
 from app.utils.money_parse import parse_monetary_amount
 from app.utils.arabic_normalizer import extract_amounts
 
@@ -45,6 +52,7 @@ def _fetch_amount_rows(doc_ids: list[str]) -> list[dict]:
                        e.normalized_value AS normalized_value,
                        e.value AS value,
                        e.entity_id AS entity_id,
+                       e.amount_currency AS amount_currency,
                        e.txn_ref AS txn_ref,
                        e.txn_date AS txn_date,
                        coalesce(e.source_page, 0) AS source_page,
@@ -89,6 +97,37 @@ def _contract_anchor_ids(doc_ids: list[str]) -> set[str]:
         return set()
 
 
+def _refs_named_alongside_an_audit_identifier(
+    doc_ids: list[str], known_refs: set[str], identifier_cores: set[str]
+) -> set[str]:
+    """Transaction refs whose own row text also names a contract/invoice of this audit.
+
+    Rows survive ingestion intact now, so a payment can be tied to the contract it
+    names in its own description — no LLM-emitted edge required.
+    """
+    if not doc_ids or not known_refs or not identifier_cores:
+        return set()
+    try:
+        chunks = get_all_chunks_for_docs(doc_ids)
+    except Exception as e:
+        logger.warning("Could not read rows for payment attribution: %s", e)
+        return set()
+
+    ref_cores = {ref: normalize_identifier(ref) for ref in known_refs if ref}
+    linked: set[str] = set()
+    for chunk in chunks:
+        for line in (chunk.get("text") or "").splitlines():
+            core = normalize_identifier(line)
+            if not core or not any(idc in core for idc in identifier_cores):
+                continue
+            for ref, ref_core in ref_cores.items():
+                if ref_core and ref_core in core:
+                    linked.add(ref)
+    if linked:
+        logger.info("Payment attribution: %d row(s) name an audited identifier", len(linked))
+    return linked
+
+
 def _parse_row_amount(row: dict) -> Optional[float]:
     raw = row.get("normalized_value") or row.get("value") or ""
     return parse_monetary_amount(str(raw).strip()) if raw else None
@@ -116,13 +155,112 @@ def _pick_invoice_total(invoice_by_doc: dict[str, dict[str, list[float]]]) -> Op
     return max(picks) if picks else None
 
 
+# Arithmetic a document states about itself. Only exact identities are checked, so a
+# warning means figures were missed or mis-tagged, not that the document is unusual.
+_ARITHMETIC_TOLERANCE = 1.0
+
+
+def _document_integrity_warnings(
+    rows: list[dict], documents: list[DocumentMeta]
+) -> list[str]:
+    """Check each document's own arithmetic against what extraction actually found.
+
+    The bank statement has its stated Total Debits; these are the equivalents for the
+    other document types, so a silent extraction miss is visible there too.
+    """
+    by_doc: dict[str, dict[str, list[float]]] = {}
+    names = {d.doc_id: d.filename for d in documents}
+    types = {d.doc_id: d.doc_type for d in documents}
+    for row in rows:
+        val = _parse_row_amount(row)
+        doc_id = str(row.get("doc_id") or "")
+        if val is None or not doc_id:
+            continue
+        role = (row.get("amount_role") or "unknown").strip().lower()
+        by_doc.setdefault(doc_id, {}).setdefault(role, []).append(val)
+
+    warnings: list[str] = []
+    for doc_id, roles in by_doc.items():
+        name = names.get(doc_id, doc_id[:8])
+        doc_type = types.get(doc_id, "unknown")
+
+        def _one(role: str) -> Optional[float]:
+            values = roles.get(role) or []
+            return max(values) if values else None
+
+        if doc_type == "invoice":
+            total, subtotal = _one("total_invoice"), _one("invoice_subtotal")
+            vat = _one("vat_tax")
+            # A late fee is a real component of the total, not a discrepancy.
+            fee = _one("late_fee") or 0.0
+            if total is not None and subtotal is not None and vat is not None:
+                expected = subtotal + vat + fee
+                if abs(total - expected) > _ARITHMETIC_TOLERANCE:
+                    parts = f"subtotal {subtotal:,.2f} + VAT {vat:,.2f}"
+                    if fee:
+                        parts += f" + late fee {fee:,.2f}"
+                    warnings.append(
+                        f"{name}: {parts} = {expected:,.2f}, "
+                        f"but the stated total is {total:,.2f}."
+                    )
+
+        if doc_type == "balance_sheet":
+            assets, liabilities = _one("total_assets"), _one("total_liabilities")
+            equity = _one("total_equity")
+            if assets is not None and liabilities is not None and equity is not None:
+                if abs(assets - (liabilities + equity)) > _ARITHMETIC_TOLERANCE:
+                    warnings.append(
+                        f"{name}: liabilities {liabilities:,.2f} + equity {equity:,.2f} = "
+                        f"{liabilities + equity:,.2f}, but total assets are {assets:,.2f}."
+                    )
+
+        if doc_type == "contract":
+            total = _one("total_contract_value")
+            milestones = roles.get("milestone_scheduled") or []
+            scheduled = sum(milestones)
+            # Only a shortfall is reported: it means schedule lines were missed. An
+            # overshoot usually means a figure was double-counted elsewhere and is
+            # left to the contradiction checks.
+            if total is not None and len(milestones) >= 2 and scheduled < total - _ARITHMETIC_TOLERANCE:
+                warnings.append(
+                    f"{name}: {len(milestones)} scheduled milestone(s) sum to "
+                    f"{scheduled:,.2f} of a stated contract total of {total:,.2f} — "
+                    f"schedule lines may be missing."
+                )
+
+    for warning in warnings:
+        logger.warning("Document arithmetic check: %s", warning)
+    return warnings
+
+
+def _snapshot_currency(rows: list[dict]) -> tuple[str, set[str]]:
+    """The currency these figures are in, plus any others present.
+
+    Everything was previously labelled EGP regardless of the documents, so a USD or
+    SAR audit rendered every card with the wrong currency. Totals across different
+    currencies are not comparable, so the caller warns when more than one appears.
+    """
+    seen = Counter(
+        code
+        for code in (str(r.get("amount_currency") or "").strip().upper() for r in rows)
+        if code
+    )
+    if not seen:
+        return "EGP", set()
+    primary, _ = seen.most_common(1)[0]
+    return primary, set(seen) - {primary}
+
+
 def _aggregate_snapshot(
     rows: list[dict],
     documents: list[DocumentMeta],
     contract_anchor_ids: Optional[set[str]] = None,
+    contract_linked_refs: Optional[set[str]] = None,
 ) -> ReconciliationSnapshot:
     doc_type_by_id = {d.doc_id: d.doc_type for d in documents}
     contract_anchor_ids = contract_anchor_ids or set()
+    # Debit refs are stored lowercased; match case-insensitively.
+    contract_linked_refs = {r.strip().lower() for r in (contract_linked_refs or set()) if r}
     all_debits_sum = 0.0
     bank_unattributed = 0
     contract_total: Optional[float] = None
@@ -139,6 +277,7 @@ def _aggregate_snapshot(
 
     stated_total_debits: dict[str, float] = {}
     bank_unknown_skipped = 0
+    bank_debits: list[dict] = []
 
     for row in rows:
         dt = doc_type_by_id.get(row.get("doc_id"), "unknown")
@@ -179,30 +318,50 @@ def _aggregate_snapshot(
                 if role == "unknown":
                     bank_unknown_skipped += 1
                 continue
-            page = int(row.get("source_page") or 0)
-            txn_ref = str(row.get("txn_ref") or "").strip().lower()
-            txn_date = str(row.get("txn_date") or "").strip().lower()
-            # Dedupe on (ref, date, amount) — never payee; page only when no ref/date.
-            if txn_ref or txn_date:
-                bkey: tuple = ("txn", doc_id, txn_ref, txn_date, _bank_round_key(val))
-            else:
-                bkey = ("line", doc_id, page, _bank_round_key(val))
-            if bkey in bank_line_keys:
-                bank_deduped = True
-                continue
-            bank_line_keys.add(bkey)
-            all_debits_sum += val
-            # Only debits linked to the contract's anchors count as paid on it.
-            anchors = set(row.get("anchor_ids") or [])
-            if not contract_anchor_ids:
-                # No contract in this document set — nothing to scope to.
-                bank_sum += val
-                bank_any = True
-            elif anchors & contract_anchor_ids:
-                bank_sum += val
-                bank_any = True
-            else:
-                bank_unattributed += 1
+            bank_debits.append({
+                "doc_id": doc_id,
+                "page": int(row.get("source_page") or 0),
+                "ref": str(row.get("txn_ref") or "").strip().lower(),
+                "date": str(row.get("txn_date") or "").strip().lower(),
+                "value": val,
+                "anchors": set(row.get("anchor_ids") or []),
+            })
+
+    # A statement's own recap ("Bank total paid: EGP 226,700") carries no transaction
+    # identity, and counting it alongside the rows it summarises double-counts them.
+    # When any row is identified, unidentified amounts are recaps, not transactions.
+    identified = [d for d in bank_debits if d["ref"] or d["date"]]
+    if identified and len(identified) < len(bank_debits):
+        logger.info(
+            "Bank aggregation: ignoring %d debit amount(s) with no transaction identity "
+            "(summary recaps, not rows)", len(bank_debits) - len(identified),
+        )
+        bank_debits = identified
+
+    for debit in bank_debits:
+        # One transaction per (ref, amount): the same row recapped on a later page
+        # repeats its ref, so keying on the ref alone collapses the duplicate.
+        if debit["ref"]:
+            bkey: tuple = ("ref", debit["doc_id"], debit["ref"], _bank_round_key(debit["value"]))
+        elif debit["date"]:
+            bkey = ("date", debit["doc_id"], debit["date"], _bank_round_key(debit["value"]))
+        else:
+            bkey = ("line", debit["doc_id"], debit["page"], _bank_round_key(debit["value"]))
+        if bkey in bank_line_keys:
+            bank_deduped = True
+            continue
+        bank_line_keys.add(bkey)
+        all_debits_sum += debit["value"]
+        # A debit is paid on this contract when a graph edge links it to the contract's
+        # anchors, or when its own row text names one of the audit's identifiers.
+        attributed = bool(debit["anchors"] & contract_anchor_ids) or (
+            debit["ref"] in contract_linked_refs
+        )
+        if not contract_anchor_ids or attributed:
+            bank_sum += debit["value"]
+            bank_any = True
+        else:
+            bank_unattributed += 1
 
     if contract_candidates:
         contract_total = max(contract_candidates)
@@ -271,8 +430,18 @@ def _aggregate_snapshot(
     elif bank_paid is None:
         notes_parts.append("Bank payment total not aggregated from graph.")
 
+    integrity = _document_integrity_warnings(rows, documents)
+    currency, other_currencies = _snapshot_currency(rows)
+    if other_currencies:
+        warning = (
+            f"Amounts appear in more than one currency ({currency}, "
+            f"{', '.join(sorted(other_currencies))}); totals mix them and are not comparable."
+        )
+        logger.warning("Reconciliation: %s", warning)
+        integrity.append(warning)
+
     return ReconciliationSnapshot(
-        currency="EGP",
+        currency=currency,
         contract_total=round(contract_total, 2) if contract_total is not None else None,
         invoice_total=round(invoice_total, 2) if invoice_total is not None else None,
         bank_paid_total=round(bank_paid, 2) if bank_paid is not None else None,
@@ -281,6 +450,7 @@ def _aggregate_snapshot(
         bank_extraction_incomplete=bank_extraction_incomplete,
         bank_debits_verified=bank_debits_verified,
         bank_debits_stated=bank_debits_stated,
+        integrity_warnings=integrity,
     )
 
 
@@ -414,34 +584,110 @@ def _row_numeric_key(v1: str, v2: str) -> frozenset:
     })
 
 
-def _findings_to_conflict_rows(findings: list[Finding]) -> list[EntityConflictRow]:
-    """Conflict rows from the same findings the Findings tab shows (≥2 headline amounts)."""
+# Fixed order so a row always reads contract → invoice → bank.
+_DOC_TYPE_ORDER: tuple[str, ...] = ("contract", "invoice", "payment_certificate", "bank_statement")
+
+
+def _amount_variants(v: float) -> tuple[str, ...]:
+    """Surface forms an amount may take in evidence text ("226,700.00", "226,700", …)."""
+    return (f"{v:,.2f}", f"{v:,.0f}", f"{v:.2f}", f"{v:.0f}")
+
+
+def _headline_amounts(text: str) -> list[float]:
+    """Distinct headline amounts in order of appearance."""
+    out: list[float] = []
+    for am in extract_amounts(text):
+        val = am.get("value")
+        if val is None or float(val) < _MIN_HEADLINE:
+            continue
+        fv = round(float(val), 2)
+        if fv not in out:
+            out.append(fv)
+    return out
+
+
+def _amount_doc_index(amount_rows: list[dict]) -> dict[float, set[str]]:
+    """value → documents that actually contain it, straight from the graph."""
+    idx: dict[float, set[str]] = {}
+    for row in amount_rows:
+        val = _parse_row_amount(row)
+        doc_id = str(row.get("doc_id") or "")
+        if val is None or not doc_id:
+            continue
+        idx.setdefault(round(val, 2), set()).add(doc_id)
+    return idx
+
+
+def _ground_amounts(
+    finding: Finding, documents: list[DocumentMeta], amount_index: dict[float, set[str]]
+) -> dict[float, str]:
+    """Map each headline amount in a finding to the document it came from.
+
+    Attribution is established, never guessed: an amount quoted verbatim in an
+    evidence line belongs to that line's document, and otherwise an amount that was
+    extracted from exactly one document belongs to that one. 
+    """
+    text = f"{finding.title}. {finding.description or ''}"
+    by_name = {d.filename: d.doc_id for d in documents}
+    grounded: dict[float, str] = {}
+    for amt in _headline_amounts(text):
+        variants = _amount_variants(amt)
+        doc_id = next(
+            (
+                did
+                for line in (finding.evidence or [])
+                for name, did in by_name.items()
+                if line.startswith(name) and any(v in line for v in variants)
+            ),
+            "",
+        )
+        if not doc_id:
+            owners = amount_index.get(amt, set())
+            if len(owners) == 1:
+                doc_id = next(iter(owners))
+        if doc_id:
+            grounded[amt] = doc_id
+    return grounded
+
+
+def _findings_to_conflict_rows(
+    findings: list[Finding],
+    documents: list[DocumentMeta],
+    amount_rows: list[dict],
+) -> list[EntityConflictRow]:
+    """Conflict rows from the same findings the Findings tab shows.
+    Each headline amount in a finding is mapped to the document it came from, and
+    then the two largest amounts from different documents are paired into a row.
+    """
+    type_by_id = {d.doc_id: d.doc_type for d in documents}
+    amount_index = _amount_doc_index(amount_rows)
+
+    def _rank(doc_id: str) -> int:
+        dt = type_by_id.get(doc_id, "")
+        return _DOC_TYPE_ORDER.index(dt) if dt in _DOC_TYPE_ORDER else len(_DOC_TYPE_ORDER)
+
     rows: list[EntityConflictRow] = []
     for f in findings:
         if f.severity not in ("critical", "warning"):
             continue
-        text = f"{f.title}. {f.description or ''}"
-        amounts: list[float] = []
-        for am in extract_amounts(text):
-            val = am.get("value")
-            if val is None or float(val) < _MIN_HEADLINE:
-                continue
-            fv = round(float(val), 2)
-            if fv not in amounts:
-                amounts.append(fv)
-        if len(amounts) < 2:
+        grounded = _ground_amounts(f, documents, amount_index)
+        pairs = sorted(grounded.items(), key=lambda kv: (_rank(kv[1]), -kv[0]))
+        first = pairs[0] if pairs else None
+        second = next((kv for kv in pairs[1:] if kv[1] != first[1]), None) if first else None
+        if first is None or second is None:
             continue
-        amounts.sort(reverse=True)
-        a, b = amounts[0], amounts[1]
+        (amt_a, doc_a), (amt_b, doc_b) = first, second
+        label_a = (type_by_id.get(doc_a) or "document").replace("_", " ")
+        label_b = (type_by_id.get(doc_b) or "document").replace("_", " ")
         rows.append(
             EntityConflictRow(
                 entity_label=f.title[:200],
-                doc_a_id=f.source_doc_id or "",
-                doc_a_value=f"{a:,.2f}",
-                doc_b_id=f.conflicting_doc_id or "",
-                doc_b_value=f"{b:,.2f}",
+                doc_a_id=doc_a,
+                doc_a_value=f"{amt_a:,.2f}",
+                doc_b_id=doc_b,
+                doc_b_value=f"{amt_b:,.2f}",
                 severity=f.severity,  # already narrowed to critical|warning above
-                conflict_type="amount finding",
+                conflict_type=f"{label_a} vs {label_b} (from finding)",
                 anchor_hint=None,
             )
         )
@@ -467,7 +713,7 @@ def _merge_conflict_rows(
 def _snapshot_has_numbers(s: ReconciliationSnapshot) -> bool:
     return any(
         x is not None for x in (s.contract_total, s.invoice_total, s.bank_paid_total)
-    ) or s.bank_extraction_incomplete
+    ) or s.bank_extraction_incomplete or bool(s.integrity_warnings)
 
 
 def _normalize_documents(documents: list) -> list[DocumentMeta]:
@@ -491,7 +737,18 @@ def build_reconciliation_payload(
     documents = _normalize_documents(documents)
     doc_ids = [d.doc_id for d in documents]
     amount_rows = _fetch_amount_rows(doc_ids)
-    snapshot = _aggregate_snapshot(amount_rows, documents, _contract_anchor_ids(doc_ids))
+    bank_doc_ids = [d.doc_id for d in documents if d.doc_type == "bank_statement"]
+    known_refs = {
+        str(r.get("txn_ref") or "").strip()
+        for r in amount_rows
+        if r.get("txn_ref") and str(r.get("doc_id")) in bank_doc_ids
+    }
+    linked_refs = _refs_named_alongside_an_audit_identifier(
+        bank_doc_ids, known_refs, audit_identifier_values(doc_ids)
+    )
+    snapshot = _aggregate_snapshot(
+        amount_rows, documents, _contract_anchor_ids(doc_ids), linked_refs
+    )
 
     # Gap-fill only empty fields from label-grounded finding amounts.
     inferred = _label_grounded_amounts(findings) if findings else {}
@@ -501,7 +758,7 @@ def build_reconciliation_payload(
         snapshot = None
 
     # Same findings as the Findings tab, plus uncovered graph-only pairs.
-    finding_rows = _findings_to_conflict_rows(findings or [])
+    finding_rows = _findings_to_conflict_rows(findings or [], documents, amount_rows)
     graph_rows = _contradictions_to_rows(find_contradictions(doc_ids))
     conflicts = _merge_conflict_rows(finding_rows, graph_rows)
     return snapshot, conflicts

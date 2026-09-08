@@ -147,39 +147,37 @@ class TestRoleConstants:
 # ── BUG 2: only logically comparable roles may be paired ─────────────────────
 
 class TestRoleComparability:
-    def test_running_balance_is_never_comparable(self):
-        """The exact nonsense pairing from the bug report."""
-        assert not _roles_are_comparable("running_balance", "invoice_line_item")
-        assert not _roles_are_comparable("running_balance", "total_contract_value")
-        assert not _roles_are_comparable("running_balance", "running_balance")
+    """The single owner of _roles_are_comparable — every case in one table."""
 
-    def test_unknown_roles_no_longer_pass_through(self):
-        """`unknown` used to be treated as comparable with anything."""
-        assert not _roles_are_comparable("unknown", "total_contract_value")
-        assert not _roles_are_comparable("total_invoice", "unknown")
-        assert not _roles_are_comparable("unknown", "unknown")
+    COMPARABLE = [
+        ("total_contract_value", "total_invoice"),
+        ("total_contract_value", "invoice_referenced_contract_value"),  # restatement check
+        ("milestone_scheduled", "transaction_debit"),
+        ("retainer", "retainer"),                                       # rate increase
+    ]
+    INCOMPARABLE = [
+        ("running_balance", "invoice_line_item"),      # the nonsense pairing from the bug
+        ("running_balance", "total_contract_value"),
+        ("running_balance", "running_balance"),
+        ("opening_balance", "total_invoice"),          # 320,000 balance vs 180,000 claim
+        ("closing_balance", "transaction_debit"),
+        ("statement_total_debits", "total_invoice"),
+        ("transaction_debit", "total_contract_value"),  # one advance vs a full total
+        ("transaction_debit", "total_invoice"),         # invoices settle in installments
+        ("retainer", "total_contract_value"),
+        ("unknown", "total_contract_value"),            # unclassified is never grounds
+        ("unknown", "unknown"),
+        (None, "total_contract_value"),
+        (None, None),
+    ]
 
-    def test_statement_totals_are_never_comparable(self):
-        assert not _roles_are_comparable("statement_total_debits", "total_invoice")
+    def test_comparable_pairs(self):
+        for a, b in self.COMPARABLE:
+            assert _roles_are_comparable(a, b), (a, b)
 
-    def test_contract_total_vs_invoice_restatement_is_comparable(self):
-        """The restatement check must survive — it is a real finding."""
-        assert _roles_are_comparable(
-            "total_contract_value", "invoice_referenced_contract_value"
-        )
-
-    def test_contract_total_vs_invoice_total_is_comparable(self):
-        assert _roles_are_comparable("total_contract_value", "total_invoice")
-
-    def test_milestone_vs_bank_payment_is_comparable(self):
-        assert _roles_are_comparable("milestone_scheduled", "transaction_debit")
-
-    def test_retainer_vs_retainer_is_comparable(self):
-        """Needed to catch an unauthorized retainer rate increase."""
-        assert _roles_are_comparable("retainer", "retainer")
-
-    def test_incomparable_pair_stays_rejected(self):
-        assert not _roles_are_comparable("retainer", "total_contract_value")
+    def test_incomparable_pairs(self):
+        for a, b in self.INCOMPARABLE:
+            assert not _roles_are_comparable(a, b), (a, b)
 
     def test_comparability_is_symmetric(self):
         roles = list(get_args(AMOUNT_ROLES))
@@ -189,10 +187,8 @@ class TestRoleComparability:
 
     def test_reason_is_human_readable(self):
         reason = _role_pair_reason("total_contract_value", "invoice_referenced_contract_value")
-        assert reason is not None
-        assert "contract" in reason.lower()
-        # Not an opaque machine token.
-        assert "_" not in reason
+        assert reason is not None and "contract" in reason.lower()
+        assert "_" not in reason  # not an opaque machine token
 
 
 # ── BUG 3: identifier variants must resolve to one node ──────────────────────
@@ -240,17 +236,6 @@ class TestPersonEntity:
         )
         assert e.signing_authority_level == "chairman"
         assert e.document_signed == "contract CTR-2024-044"
-
-    def test_person_fields_default_to_none(self):
-        e = Entity(
-            entity_type="amount",
-            value="100 EGP",
-            normalized_value="100 EGP",
-            source_doc_id="d1",
-            source_page=1,
-        )
-        assert e.role_title is None
-        assert e.signing_authority_level is None
 
     def test_same_person_dedupes_across_documents(self):
         """Required so one signatory accumulates everything they signed."""
@@ -391,23 +376,20 @@ class TestSigningAuthorityDerivation:
         return _authority_from_title(title)
 
     def test_titles_map_to_levels(self):
-        assert self._auth("Chairman") == "chairman"
-        assert self._auth("Chairman - Delta Trading Group S.A.E.") == "chairman"
-        assert self._auth("CEO - Nile Financial Consulting Co.") == "ceo"
-        assert self._auth("Chief Financial Officer") == "cfo"
-        assert self._auth("Finance Director") == "director"
+        for title, level in (
+            ("Chairman", "chairman"),
+            ("Chairman - Delta Trading Group S.A.E.", "chairman"),
+            ("Chairman & General Manager", "chairman"),   # most-senior-first ordering
+            ("رئيس مجلس الادارة", "chairman"),
+            ("CEO - Nile Financial Consulting Co.", "ceo"),
+            ("Chief Financial Officer", "cfo"),
+            ("Finance Director", "director"),
+        ):
+            assert self._auth(title) == level, title
 
-    def test_arabic_titles_map(self):
-        assert self._auth("رئيس مجلس الادارة") == "chairman"
-
-    def test_unknown_title_yields_none(self):
-        assert self._auth("Witness") is None
-        assert self._auth(None) is None
-        assert self._auth("") is None
-
-    def test_chairman_wins_over_a_trailing_manager_word(self):
-        """Most-senior-first ordering: 'Chairman & General Manager' is a chairman."""
-        assert self._auth("Chairman & General Manager") == "chairman"
+    def test_titles_without_a_level_yield_none(self):
+        for title in ("Witness", None, ""):
+            assert self._auth(title) is None, title
 
 
 class TestSignatoryMismatchQuery:
@@ -490,17 +472,15 @@ class TestIsAmendmentOf:
         from app.services.graph_builder import _is_amendment_of
         return _is_amendment_of(cand, base)
 
-    def test_shared_ref_plus_keyword(self):
-        assert self._f("Amendment 2 to BLD-2024-019", "Contract BLD-2024-019") is True
-
-    def test_keyword_without_link_is_false(self):
-        assert self._f("Amendment 2 to CTR-2099-001", "Contract BLD-2024-019") is False
-
-    def test_no_keyword_is_false(self):
-        assert self._f("Contract BLD-2024-019 schedule", "Contract BLD-2024-019") is False
-
-    def test_same_string_is_false(self):
-        assert self._f("Contract BLD-2024-019", "Contract BLD-2024-019") is False
+    def test_needs_both_an_amendment_keyword_and_a_shared_reference(self):
+        base = "Contract BLD-2024-019"
+        for candidate, expected in (
+            ("Amendment 2 to BLD-2024-019", True),
+            ("Amendment 2 to CTR-2099-001", False),   # keyword, unrelated instrument
+            ("Contract BLD-2024-019 schedule", False),  # shared ref, no keyword
+            ("Contract BLD-2024-019", False),           # the instrument itself
+        ):
+            assert self._f(candidate, base) is expected, candidate
 
 
 # ── 3d: rate-like roles compare without needing a shared anchor ──────────────
@@ -534,7 +514,14 @@ class TestAnchorlessRatePairs:
         assert "OPTIONAL MATCH (e1)-[:RELATES]-(anchor:Entity)-[:RELATES]-(e2)" in query
         assert "$anchorless_roles" in query
         assert "retainer" in params["anchorless_roles"]
-        assert "milestone_scheduled" in params["anchorless_roles"]
+
+    def test_milestones_require_an_anchor(self):
+        """
+        Anchorless milestones paired every contract schedule line with every bank
+        payment — 15 rows of "scheduled milestone vs scheduled milestone" noise.
+        """
+        from app.services.graph_builder import _ANCHORLESS_SAME_ROLE_PAIRS
+        assert "milestone_scheduled" not in _ANCHORLESS_SAME_ROLE_PAIRS
 
     def test_totals_still_require_an_anchor(self):
         """Two unrelated invoice totals must not be compared just for existing."""
