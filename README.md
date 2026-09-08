@@ -54,9 +54,9 @@ flowchart LR
     FastAPI --> NextUI[Next.js UI]
     NextUI -->|Q&A / triage| FastAPI
 
-    LLM[[OpenRouter / Gemini]] -.-> Extraction
-    LLM -.-> CrossChecker
-    LLM -.-> ReportWriter
+    LLM[[LLM provider\nOpenRouter default / Gemini]] -. prompts .-> Extraction
+    LLM -. prompts .-> CrossChecker
+    LLM -. prompts .-> ReportWriter
 
     style Qdrant fill:#4a6fa5,color:#fff
     style Neo4j fill:#2a6b4a,color:#fff
